@@ -554,6 +554,7 @@ def emit(payload):
 # ------------------------------------------------------------- normalizers
 def normalize_settings(parsed):
     out = {
+        "showAppIcons": False,
         "webSuggestions": False,
         "searchEngine": "g",
         "fileSearch": True,
@@ -563,6 +564,7 @@ def normalize_settings(parsed):
     }
     if not isinstance(parsed, dict):
         return out
+    out["showAppIcons"] = clamp_bool(parsed.get("showAppIcons"), False)
     out["webSuggestions"] = clamp_bool(parsed.get("webSuggestions"), False)
     out["fileSearch"] = clamp_bool(parsed.get("fileSearch"), True)
     out["fileSearchAlways"] = clamp_bool(parsed.get("fileSearchAlways"), False)

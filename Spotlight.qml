@@ -161,6 +161,7 @@ Item {
   readonly property int maxSubtitleChars: 1024
 
   property var settings: ({
+    showAppIcons: false,
     webSuggestions: false,
     searchEngine: "g",
     fileSearch: true,
@@ -194,8 +195,9 @@ Item {
   readonly property int listPadding: Style.space(10)
   readonly property int rowInset: gutter - listPadding
 
-  readonly property int cardRadius: Style.space(12)
-  readonly property int rowRadius: Style.space(8)
+  readonly property int cardRadius: 0
+  readonly property int rowRadius: 0
+  readonly property int cardBorderWidth: Style.space(2)
   readonly property int searchHeight: Style.space(56)
   readonly property int rowHeight: Style.space(40)
   readonly property int sectionHeight: Style.space(30)
@@ -210,7 +212,7 @@ Item {
   // Fixing the top edge at the position the *fully expanded* panel would need
   // to sit centred means the panel grows downward into the middle of the
   // screen instead of shoving the search field around as results arrive.
-  readonly property int maxCardHeight: searchHeight + hairline
+  readonly property int maxCardHeight: cardBorderWidth * 2 + searchHeight + hairline
     + listPadding * 2 + maxListHeight + hairline + footerHeight
 
   // ------------------------------------------------------------- lifecycle
@@ -420,6 +422,7 @@ Item {
     var reply = root.helperReply(raw)
     var parsed = (reply && reply.settings) ? reply.settings : {}
     root.settings = {
+      showAppIcons: parsed.showAppIcons === true,
       webSuggestions: parsed.webSuggestions === true,
       searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
       fileSearch: parsed.fileSearch !== false,
@@ -566,6 +569,21 @@ Item {
     return root.appLibrary ? root.appLibrary.entrySubtext(entry) : Apps.entrySubtext(entry)
   }
 
+  function isWebApp(entry) {
+    if (!entry) return false
+    var exec = String(entry.exec || "")
+    if (exec.indexOf("omarchy-launch-webapp") !== -1 || exec.indexOf("omarchy-webapp-handler") !== -1 || exec.indexOf("webapp") !== -1) {
+      return true
+    }
+    var id = String(entry.id || "").toLowerCase()
+    if (id.indexOf("webapp") !== -1) return true
+    var comment = String(entry.comment || "").toLowerCase()
+    if (comment.indexOf("web app") !== -1) return true
+    var generic = String(entry.genericName || "").toLowerCase()
+    if (generic.indexOf("web app") !== -1) return true
+    return false
+  }
+
   // AppLibrary keeps its own index of icons installed after the shell started,
   // because this process's themed-icon cache never re-scans. Without it, the
   // themed lookup is what there is, and an app installed since login falls
@@ -623,13 +641,15 @@ Item {
     var out = []
     for (var j = 0; j < candidates.length && out.length < limit; j++) {
       var c = candidates[j]
+      var isWeb = root.isWebApp(c.entry)
       out.push(root.row({
         key: c.key,
         section: "Applications", kind: "app",
         title: root.appName(c.entry),
         subtitle: root.appSubtext(c.entry),
-        accessory: "Application",
-        image: root.appIcon(c.entry.icon),
+        accessory: isWeb ? "Web App" : "Application",
+        icon: isWeb ? "󰖟" : "󰀻",
+        image: (root.settings && root.settings.showAppIcons) ? root.appIcon(c.entry.icon) : "",
         primaryLabel: "Open",
         payload: { appId: String(c.entry.id || ""), name: root.appName(c.entry) }
       }))
@@ -710,7 +730,7 @@ Item {
         kind: c.kind,
         title: c.title, subtitle: c.subtitle,
         accessory: c.kind === "url" ? "Link" : (fromMenu ? "Menu" : "Command"),
-        icon: c.icon,
+        icon: (c.kind === "shell" || fromMenu) ? "󰩹" : (c.kind === "url" ? "󰖟" : (c.icon || "󰩹")),
         primaryLabel: c.kind === "url" ? "Open in browser" : "Run",
         confirm: c.confirm === true,
         payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
@@ -1544,7 +1564,7 @@ Item {
       readonly property bool hasResults: displayModel.count > 0
 
       width: Math.min(Style.space(750), panel.width - Style.space(48))
-      height: root.searchHeight
+      height: root.cardBorderWidth * 2 + root.searchHeight
         + (hasResults ? root.hairline + root.listPadding * 2 + listHeight : 0)
         + root.hairline + root.footerHeight
       // Centred at whatever height it currently is, not just when full. The
@@ -1556,7 +1576,7 @@ Item {
 
       radius: root.cardRadius
       color: root.glassBackground
-      border.width: root.hairline
+      border.width: root.cardBorderWidth
       border.color: root.glassBorder
       antialiasing: true
 
@@ -1571,7 +1591,7 @@ Item {
       // panel read as glass rather than as a flat tint.
       Rectangle {
         anchors { top: parent.top; left: parent.left; right: parent.right }
-        anchors.margins: root.hairline
+        anchors.margins: root.cardBorderWidth
         height: root.hairline
         color: root.glassSheen
         radius: height
@@ -1581,6 +1601,7 @@ Item {
       Item {
         id: searchRow
         anchors { top: parent.top; left: parent.left; right: parent.right }
+        anchors.topMargin: root.cardBorderWidth
         height: root.searchHeight
 
         Text {
@@ -1676,8 +1697,8 @@ Item {
       Rectangle {
         id: searchDivider
         anchors { top: searchRow.bottom; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.cardBorderWidth
+        anchors.rightMargin: root.cardBorderWidth
         height: root.hairline
         color: root.dividerColor
         visible: card.hasResults
@@ -1763,6 +1784,8 @@ Item {
                 : (resultRow.hasCursor ? root.selectedBackground : "transparent")
             }
 
+            readonly property bool hasIcon: (resultRow.rowImage.length > 0) || (resultRow.rowIcon.length > 0)
+
             Image {
               id: rowImageItem
               visible: resultRow.rowImage.length > 0
@@ -1780,7 +1803,7 @@ Item {
 
             Text {
               id: rowGlyph
-              visible: resultRow.rowImage.length === 0
+              visible: resultRow.rowImage.length === 0 && resultRow.rowIcon.length > 0
               text: resultRow.rowIcon
               textFormat: Text.PlainText
               color: resultRow.hasCursor ? root.selectedText : root.foreground
@@ -1808,8 +1831,8 @@ Item {
             }
 
             Row {
-              anchors.left: rowGlyph.right
-              anchors.leftMargin: Style.space(10)
+              anchors.left: resultRow.hasIcon ? (rowImageItem.visible ? rowImageItem.right : rowGlyph.right) : rowSurface.left
+              anchors.leftMargin: resultRow.hasIcon ? Style.space(10) : root.rowInset
               anchors.right: accessoryText.left
               anchors.rightMargin: Style.space(14)
               anchors.verticalCenter: rowSurface.verticalCenter
@@ -1871,8 +1894,8 @@ Item {
       // ------------------------------------------------------- footer
       Rectangle {
         anchors { bottom: footer.top; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.hairline
-        anchors.rightMargin: root.hairline
+        anchors.leftMargin: root.cardBorderWidth
+        anchors.rightMargin: root.cardBorderWidth
         height: root.hairline
         color: root.dividerColor
       }
@@ -1880,11 +1903,11 @@ Item {
       Item {
         id: footer
         anchors { bottom: parent.bottom; left: parent.left; right: parent.right }
-        anchors.bottomMargin: root.hairline
+        anchors.bottomMargin: root.cardBorderWidth
         height: root.footerHeight
 
         Text {
-          text: "󰣇  Omarchy"
+          text: "󰣇  Omarchy // Lunardi0x01"
           textFormat: Text.PlainText
           color: root.foreground
           opacity: 0.35
