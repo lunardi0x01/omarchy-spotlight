@@ -2404,6 +2404,8 @@ Item {
     typingGuard.restart()
 
     var q = String(root.query || "").trim()
+    // Clearing the search dismisses the saved answer as well as the panel.
+    if (!q && root.aiQuery !== "") root.stopAi()
     var parsed = Query.parse(q)
     root.updateCurrency()
 

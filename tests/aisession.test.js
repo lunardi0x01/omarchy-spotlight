@@ -128,6 +128,28 @@ event('result', {result: {text: 'Disabled response'}}, disabledGeneration);
 assert.equal(root.aiResult, null);
 
 root.settings.aiEnabled = true;
+for (const state of ['busy', 'result', 'error']) {
+  context.input.text = 'ai: clear ' + state;
+  root.startAi();
+  const clearedProcess = root.aiProcess, clearedGeneration = root.aiGeneration;
+  if (state === 'result') event('result', {result: {text: 'Answer to discard'}});
+  if (state === 'error') root.failAi('Error to discard');
+  const notificationCount = notifications.length;
+  context.input.text = '';
+  assert.equal(clearedProcess.running, false, 'Clearing the query stops its AI process');
+  event('result', {result: {text: 'Late answer'}}, clearedGeneration);
+  assert.equal(notifications.length, notificationCount, 'Cleared requests cannot notify later');
+  for (let reopen = 0; reopen < 2; reopen++) {
+    root.close(); root.open('{}');
+    assert.equal(context.input.text, '', 'A cleared ' + state + ' query must stay cleared');
+    assert.equal(root.aiActive, false);
+    assert.equal(root.aiBusy, false);
+    assert.equal(root.aiResult, null);
+    assert.equal(root.aiError, '');
+    assert.equal(root.aiQuery, '');
+  }
+}
+
 root.settings.aiWebSearch = true;
 root.settings.artifactSettings = {weather: {defaultLocation: 'Berlin'}};
 for (const [query, location, weather] of [
