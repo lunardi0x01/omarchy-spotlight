@@ -3491,6 +3491,8 @@ def ai_result(raw, provider, allow_weather=False, weather_request=False):
         raise Denied("AI returned an invalid response")
     kind, body, commands = value["kind"], value.get("text"), value.get("commands")
     artifacts = value.get("artifacts", [])
+    if artifacts is None:
+        artifacts = []
     if (not isinstance(body, str) or not isinstance(commands, list) or len(commands) > 6
             or not isinstance(artifacts, list) or len(artifacts) > 2):
         raise Denied("AI returned an invalid response")
