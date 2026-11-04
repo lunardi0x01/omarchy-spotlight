@@ -314,7 +314,8 @@ Item {
   // The empty query is a digest, not a search: every source is capped on its
   // own so the longest one cannot crowd the others off the list. Ranking.rank
   // already orders the sections by result type.
-  readonly property int idleAppRows: 5
+  // Every app when nothing is typed, not a five-app digest (lunardi0x01).
+  readonly property int idleAppRows: maxAppCandidates
   readonly property int idleWindowRows: 2
   readonly property int idleCommandRows: 1
   readonly property int idleFileRows: 2
@@ -1662,7 +1663,7 @@ Item {
     input.cursorPosition = input.text.length
   }
 
-  function globallyRank(list, q) {
+  function globallyRank(list, q, maxRows) {
     var now = Date.now()
     var context = Query.contextKey(Query.parse(root.query))
     for (var i = 0; i < list.length; i++) {
@@ -1677,7 +1678,7 @@ Item {
       row.frequencyBonus = bonus.frequency
       row.contextBonus = bonus.context
     }
-    var limit = Util.clamp(root.settings.maxResults, 8, root.maxGlobalResults)
+    var limit = maxRows > 0 ? maxRows : Util.clamp(root.settings.maxResults, 8, root.maxGlobalResults)
     return Ranking.rank(list, limit)
   }
 
@@ -1708,6 +1709,7 @@ Item {
     function push(list) { for (var i = 0; i < list.length; i++) next.push(list[i]) }
 
     var view = Query.isView(parsed.filter)
+    var idle = false
     if (parsed.filter === "ai") {
       next.push(root.row({
         key: "ai.ask", kind: !root.settings.aiEnabled ? "spotlight-settings" : parsed.empty ? "noop" : "ai",
@@ -1741,6 +1743,7 @@ Item {
         push(root.intentRows(parsed.text, parsed.filter))
       }
     } else if (!q) {
+      idle = true
       push(root.idleRows())
     } else {
       push(root.viewCompletionRows(q))
@@ -1759,7 +1762,8 @@ Item {
     }
 
     // A view's rows arrive ranked and bounded by lib/Views.js.
-    if (!view) next = root.globallyRank(next, parsed.text)
+    // The empty-query list is not capped, so it can hold every app.
+    if (!view) next = root.globallyRank(next, parsed.text, idle ? next.length : 0)
     root.rows = next
 
     displayModel.clear()
