@@ -3105,7 +3105,8 @@ Item {
         - root.cardBorderWidth * 2 - root.searchHeight - root.footerHeight - root.hairline * 2 - root.listPadding * 2)
       readonly property int bodyHeight: Math.min(root.maxListHeight, availableBodyHeight)
 
-      width: Math.min(Style.space(960), panel.width - Style.space(48))
+      // Narrower when the preview pane is off, so the list is not stretched (lunardi0x01).
+      width: Math.min(Style.space(root.settings.previewPane !== false ? 960 : 750), panel.width - Style.space(48))
       height: root.cardBorderWidth * 2 + root.searchHeight
         + root.hairline + root.listPadding * 2 + bodyHeight
         + root.hairline + root.footerHeight
