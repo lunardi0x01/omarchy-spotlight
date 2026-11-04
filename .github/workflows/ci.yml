@@ -70,10 +70,10 @@ jobs:
           PY
 
       - name: Run Python tests
-        run: python -m unittest -v tests/helper_test.py
+        run: python -m unittest discover -s tests -p '*_test.py' -v
 
       - name: Run Node.js tests
-        run: node --test tests/apps.test.js tests/filerank.test.js
+        run: node --test
 
       - name: Check committed whitespace
         run: git diff --check HEAD^ HEAD

@@ -4,9 +4,13 @@ import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
+import "ui/components"
+import "ui/panels"
 import "lib/Calc.js" as Calc
 import "lib/Units.js" as Units
+import "lib/Currency.js" as Currency
 import "lib/NaturalTime.js" as NaturalTime
 import "lib/Web.js" as Web
 import "lib/Fuzzy.js" as Fuzzy
@@ -14,6 +18,13 @@ import "lib/Frecency.js" as Frecency
 import "lib/Commands.js" as Commands
 import "lib/Apps.js" as Apps
 import "lib/FileRank.js" as FileRank
+import "lib/Query.js" as Query
+import "lib/Views.js" as Views
+import "lib/Preview.js" as Preview
+import "lib/Ranking.js" as Ranking
+import "lib/Chord.js" as Chord
+import "lib/SettingsQueue.js" as SettingsQueue
+import "lib/WeatherIntent.js" as WeatherIntent
 
 // Spotlight — a Raycast-shaped command palette for Omarchy.
 //
@@ -30,6 +41,7 @@ Item {
   onShellChanged: {
     root.refreshHides()
     root.refreshMenuCommands()
+    root.refreshPluginCommands()
   }
   property var manifest: null
 
@@ -46,6 +58,8 @@ Item {
   // over again, every path below switches back to it on its own.
   readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
   readonly property string home: Quickshell.env("HOME")
+  readonly property string pluginFolder: decodeURIComponent(
+    String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, ""))
 
   // Spotlight is `keepLoaded`, so it lives inside the long-running
   // omarchy-shell process rather than being torn down with the overlay.
@@ -76,16 +90,145 @@ Item {
     return null
   }
 
+  function helperError(raw) {
+    try {
+      var text = String(raw || "")
+      if (text.length > root.maxHelperPayloadChars) return ""
+      var parsed = JSON.parse(text)
+      if (parsed && typeof parsed.error === "string") return parsed.error.slice(0, 120)
+    } catch (e) {
+    }
+    return ""
+  }
+
   // ------------------------------------------------------------- state
   property bool opened: false
+  property real presentationProgress: opened ? 1 : 0
+  onPresentationProgressChanged: if (presentationProgress === 0 && !opened) root.finishClose()
+  Behavior on presentationProgress {
+    id: presentationMotion
+    NumberAnimation {
+      duration: root.settings.reduceMotion ? 0 : (presentationMotion.targetValue === 1 ? 220 : 140)
+      easing.type: presentationMotion.targetValue === 1 ? Easing.OutCubic : Easing.InCubic
+    }
+  }
   property string query: ""
   property int selectedIndex: 0
+  // The right pane only browses the row selected on the left. Once that row
+  // changes (hover, a click, an async rebuild) the listing belongs to nothing
+  // on screen, so browsing ends with it.
+  onSelectedIndexChanged: {
+    if (root.folderProcess) root.folderProcess.running = false
+    root.folderProcess = null
+    if (root.folderPath) {
+      root.folderStack = []
+      root.folderRows = []
+      root.folderPath = ""
+    }
+    root.schedulePreview()
+  }
   property bool cursorActive: true
+  property bool navigatingResults: false
+  property var folderStack: []
+  property var folderRows: []
+  property string folderPath: ""
+  property int folderIndex: 0
+  property var folderProcess: null
+
+  function resetFolders() {
+    if (root.folderProcess) root.folderProcess.running = false
+    root.folderProcess = null
+    root.folderStack = []
+    root.folderRows = []
+    root.folderPath = ""
+    root.navigatingResults = false
+  }
+
+  function enterFolder() {
+    if (!root.previewShown) return false
+    var r = root.folderPath ? root.folderRows[root.folderIndex] : root.selectedRow()
+    if (!r || r.kind !== "file" || r.accessory !== "Folder") return false
+    if (root.folderProcess) root.folderProcess.running = false
+    var proc = folderProcessComponent.createObject(root, { path: r.payload.path })
+    root.folderProcess = proc
+    proc.running = true
+    return true
+  }
+
+  function loadFolder(raw, proc) {
+    if (root.folderProcess !== proc || !root.opened) return
+    root.folderProcess = null
+    var reply = root.helperReply(raw)
+    var next = []
+    if (reply && reply.kind === "dir") {
+      var entries = reply.entries || []
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i]
+        next.push(root.row({ key: "file:" + e.path, kind: "file", title: e.name,
+          subtitle: proc.path, section: proc.path, resultType: "file",
+          accessory: e.isDir ? "Folder" : "File", icon: e.isDir ? "󰉋" : "󰈔",
+          primaryLabel: "Open", secondaryLabel: "Open folder",
+          payload: { path: e.path, dir: proc.path } }))
+      }
+      if (reply.more) next.push(root.row({ kind: "noop", title: "Showing the first " + entries.length + " entries", section: proc.path }))
+    }
+    if (!next.length) next.push(root.row({ kind: "noop", section: proc.path,
+      title: !reply ? "Folder unavailable" : reply.kind === "hidden" ? "Contents hidden for private files"
+        : reply.kind === "dir" ? "Empty folder" : "Not a folder" }))
+    root.folderStack = root.folderStack.concat([{ path: root.folderPath, rows: root.folderRows,
+      index: root.folderIndex }])
+    root.folderPath = proc.path
+    root.folderRows = next
+    root.folderIndex = 0
+  }
+
+  function leaveFolder() {
+    if (root.folderProcess) root.folderProcess.running = false
+    root.folderProcess = null
+    if (!root.folderStack.length) return false
+    var stack = root.folderStack.slice()
+    var previous = stack.pop()
+    root.folderStack = stack
+    root.folderPath = previous.path
+    root.folderRows = previous.rows
+    root.folderIndex = previous.index
+    return true
+  }
+
+  Component {
+    id: folderProcessComponent
+    Process {
+      id: folderRun
+      required property string path
+      property bool delivered: false
+      command: root.helperArgv(["browse-directory", path])
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          folderRun.delivered = true
+          root.loadFolder(text, folderRun)
+        }
+      }
+      onExited: Qt.callLater(function() {
+        if (!folderRun.delivered) root.loadFolder("", folderRun)
+        folderRun.destroy()
+      })
+    }
+  }
 
   // Rows currently on screen, as plain JS objects. displayModel mirrors only
   // the display fields; the payload stays here and is read back by index, so
   // ListModel never has to hold a nested object.
   property var rows: []
+  property bool aiActive: false
+  property bool aiBusy: false
+  property string aiError: ""
+  property string aiProgress: ""
+  property var aiResult: null
+  property string aiQuery: ""
+  property real aiReadPosition: 0
+  property int aiGeneration: 0
+  property var aiProcess: null
 
   // Async provider caches. Each is refreshed by its own Process and triggers a
   // rebuild when it lands, so a slow provider never blocks the fast ones.
@@ -95,6 +238,17 @@ Item {
   property string fileFor: ""
   property var reminderRows: []
   property var clipboardRows: []
+  property string clipboardFor: ""
+  property var tldrPage: null
+  property var viewRows: []
+  property string viewState: "idle"
+  property string viewName: ""
+  property int viewGeneration: 0
+  property var viewProcess: null
+  property bool viewPartial: false
+  property var currencySession: Currency.createSession()
+  property var currencyProcess: null
+  property var pendingCurrency: null
 
   // Destructive commands need a second Enter. Holds the row key that is armed.
   property string armedKey: ""
@@ -117,32 +271,27 @@ Item {
   // source.
   property var menuCommands: []
 
-  // Decayed launch counts, keyed by row key. See lib/Frecency.js.
-  property var usage: Frecency.emptyMap()
+  // Enabled panels, overlays and menus discovered through shell IPC.
+  property var pluginCommands: []
 
-  // Frecency is a bonus on top of the match score, never a replacement for it.
-  // Both caps sit under the smallest gap between two match tiers (500 in the
-  // shell's AppSearch, 500 in Fuzzy), so usage reorders rows that matched
-  // equally well and can never lift a weak match over a name that starts with
-  // what was typed.
-  readonly property int appFrecencyBoost: 450
-  readonly property int commandFrecencyBoost: 400
-  // With no query there is no match score to respect, so frecency owns the
-  // order outright and the alphabetical fallback only breaks its ties.
-  readonly property int idleFrecencyBoost: 100000
-  // Cap on remembered keys. Everything past it is the tail nothing ranks by.
-  // The helper enforces the same number on the way in and on the way out, so
-  // the store cannot grow past it by being edited by hand either.
-  readonly property int usageKeepCount: 400
+  // Live state of every toggle the helper could actually read, as
+  // { stateId: bool }. An id the probe could not answer is absent rather than
+  // false, and an absent id draws no switch: a missing state is unknown, and
+  // a switch that is confidently wrong is worse than no switch at all.
+  property var toggleStates: ({})
+
+  // Versioned learning store: stable items plus query-local contexts. The
+  // helper validates and bounds it before it reaches this long-lived process.
+  property var usage: Frecency.emptyStore()
 
   // Hard ceilings on everything the model will hold, applied where the rows
   // are built rather than after. maxApps is a user setting, so it is clamped
   // rather than trusted; the rest bound lists that arrive from outside.
   readonly property int maxAppRows: 24
-  readonly property int maxIdleAppRows: 60
-  // The helper returns at most 400 hits (a scan pool, ranked below); the
-  // list shows the best 10 of them.
-  readonly property int maxFileRows: 10
+  // The helper returns at most 400 hits; the shared global cap shows at most
+  // 50 after ranking.
+  readonly property int maxFileRows: 50
+  readonly property int maxUnifiedFileRows: 4
   // Must match bin/spotlight-helper's file-search limits: the helper first
   // truncates the pattern to 256 characters, then AND-filters on its first
   // 8 terms. FileRank must score that same bounded pattern; otherwise text
@@ -150,68 +299,127 @@ Item {
   // or favor an incidental match.
   readonly property int filePatternChars: 256
   readonly property int fileMaxTerms: 8
-  readonly property int maxClipboardRows: 8
+  readonly property int maxClipboardRows: 50
   readonly property int maxReminderRows: 50
+  // The helper returns at most 200 entries; lib/Views.js adds at most one
+  // extra row (direct connect, manage, or a note).
+  readonly property int maxViewEntries: 200
   readonly property int maxQueryChars: 512
   readonly property int maxPayloadChars: 4096
   readonly property int maxHelperPayloadChars: 524288
   readonly property int maxAppCandidates: 512
   readonly property int maxWindowCandidates: 256
+  readonly property int maxGlobalResults: 50
+
+  // The empty query is a digest, not a search: every source is capped on its
+  // own so the longest one cannot crowd the others off the list. Ranking.rank
+  // already orders the sections by result type.
+  readonly property int idleAppRows: 5
+  readonly property int idleWindowRows: 2
+  readonly property int idleCommandRows: 1
+  readonly property int idleFileRows: 2
   readonly property int maxTitleChars: 512
   readonly property int maxSubtitleChars: 1024
 
   property var settings: ({
     showAppIcons: false,
     webSuggestions: false,
+    currencyRates: true,
     searchEngine: "g",
+    defaultCurrency: "",
     fileSearch: true,
-    fileSearchAlways: false,
+    fileSearchAlways: true,
+    clipboardSearch: true,
+    clipboardSearchAlways: true,
+    previewPane: true,
+    reduceMotion: false,
+    learningEnabled: true,
+    aiEnabled: false,
+    aiProvider: "claude",
+    aiModel: "",
+    aiEffort: "",
+    aiWebSearch: false,
+    artifactSettings: ({ weather: { defaultLocation: "" } }),
+    maxResults: 20,
     maxApps: 8,
-    maxSuggestions: 4
+    maxSuggestions: 4,
+    verticalPosition: 50,
+    horizontalPosition: 50,
+    // true until the helper answers, so the tour never flashes before the
+    // first-run flag has actually been read.
+    setupCompleted: true
   })
+
+  // ------------------------------------------------------------- tour
+  // The setup tour replaces the search card inside the same PanelWindow.
+  // Spotlight.qml does all of the tour's I/O; SetupTour.qml only paints.
+  property bool tourActive: false
+  property string bindingState: ""
+  property var tourBinding: ({ current: "", previous: "", managed: false,
+                              bound: {}, unknownMods: [] })
+  // Written on first run so a fresh install has a working shortcut before the
+  // tour is ever opened. The tour can still change it.
+  readonly property string defaultChord: "ALT + SPACE"
+  property bool autoBindDone: false
+  // A tour started from the settings panel hands back to it.
+  property bool tourFromSettings: false
+
+  // ------------------------------------------------------- settings panel
+  // The panel paints settings; this file writes them.
+  property bool settingsActive: false
+  property var aiModels: ({ claude: [], codex: [] })
+  property var settingsWrites: SettingsQueue.create()
+  // Set by a saved write: a read started before it must not undo it.
+  property bool settingsReadStale: false
+  readonly property bool settingsSaveFailed: settingsWrites.failed
+  property string settingsSaveError: ""
+  // spotlight.json was asked for while a write was queued; open it once saved.
+  property bool editAfterSave: false
 
   // ------------------------------------------------------------- theme
   // Shares the [menu] surface tokens, so any theme that styles the Omarchy
   // menu styles this too. The card is deliberately translucent: the frost is
   // Hyprland's, applied to this layer's namespace.
-  readonly property color foreground: Color.menu.text
-  readonly property color accent: Color.accent
+  readonly property color foreground: Commons.Color.menu.text
+  readonly property color accent: Commons.Color.accent
   // Frosted glass needs something left to frost: at 0.86 the card is opaque
   // and Hyprland's blur has no visible effect. 0.62 keeps text contrast while
   // letting the blurred wallpaper through as colour and shape.
-  readonly property color glassBackground: Util.alpha(Color.menu.background, 0.62)
-  readonly property color glassBorder: Util.alpha(Color.foreground, 0.16)
+  readonly property color glassBackground: Util.alpha(Commons.Color.menu.background, 0.62)
+  readonly property color glassBorder: Util.alpha(Commons.Color.foreground, 0.09)
   readonly property color glassSheen: Util.alpha("#ffffff", 0.07)
-  readonly property color scrim: Util.alpha(Color.menu.scrim, 0.25)
-  readonly property color selectedBackground: Util.alpha(Color.foreground, 0.12)
-  readonly property color selectedText: Color.menu.selectedText
-  readonly property color dividerColor: Util.alpha(Color.foreground, 0.10)
+  readonly property color scrim: Util.alpha(Commons.Color.menu.scrim, 0.25)
+  readonly property color selectedBackground: Util.alpha(Commons.Color.foreground, 0.12)
+  readonly property color selectedText: Commons.Color.menu.selectedText
+  readonly property color dividerColor: Util.alpha(Commons.Color.foreground, 0.06)
   readonly property string fontFamily: Style.font.menuFamily
 
-  // One left rail at `gutter`. The search glyph, every row icon and every
-  // section header align to it; a row is inset by `listPadding` and carries
+  // One left rail at `gutter`. The search glyph and every row icon align to
+  // it; a row is inset by `listPadding` and carries
   // the remainder internally, so the rail survives the inset.
-  readonly property int gutter: Style.space(24)
+  readonly property int gutter: Style.space(21)
   readonly property int listPadding: Style.space(10)
   readonly property int rowInset: gutter - listPadding
 
+  // Square corners and a 2px border (lunardi0x01 styling).
   readonly property int cardRadius: 0
   readonly property int rowRadius: 0
   readonly property int cardBorderWidth: Style.space(2)
   readonly property int searchHeight: Style.space(56)
-  readonly property int rowHeight: Style.space(40)
-  readonly property int sectionHeight: Style.space(30)
+  readonly property int rowHeight: Style.space(36)
+  readonly property int sectionHeight: Style.space(24)
   readonly property int footerHeight: Style.space(36)
-  readonly property int maxListHeight: Style.space(400)
+  // Sized so the full empty-query digest lands above the fold: 5 apps, 1
+  // command, 2 files and 2 windows at rowHeight, plus their four section
+  // headings at sectionHeight. A query may still scroll.
+  readonly property int maxListHeight: Style.space(456)
   readonly property int hairline: Style.spacing.hairline
 
   // Between heading (16) and display (24): a hero input that is still an
   // input. Scales with the user's font size rather than being pinned to 18px.
   readonly property int searchFontSize: Math.round(Style.font.baseSize * 1.5)
 
-  // Fixing the top edge at the position the *fully expanded* panel would need
-  // to sit centred means the panel grows downward into the middle of the
-  // screen instead of shoving the search field around as results arrive.
+  // Reserve the fully expanded height so results never move the search field.
   readonly property int maxCardHeight: cardBorderWidth * 2 + searchHeight + hairline
     + listPadding * 2 + maxListHeight + hairline + footerHeight
 
@@ -219,6 +427,8 @@ Item {
   // The payload may carry {"query": "..."} so a keybind can summon Spotlight
   // already primed, e.g. bound to open straight into "remind me ".
   function open(payloadJson) {
+    if (!root.opened) root.finishClose()
+    root.resetFolders()
     var initial = ""
     try {
       var rawPayload = String(payloadJson || "{}")
@@ -229,12 +439,22 @@ Item {
     } catch (e) {
       initial = ""
     }
+    var resumeAi = (!initial || initial === root.aiQuery) && root.aiQuery !== ""
+      && (root.aiBusy || root.aiResult !== null || root.aiError !== "")
 
     root.opened = true
+    root.tourActive = false
+    root.settingsActive = false
+    root.tourFromSettings = false
     root.armedKey = ""
+    root.pendingCurrency = null
     root.rows = []
+    root.aiActive = false
     root.pinnedKey = ""
-    input.text = initial
+    root.refreshPluginCommands()
+    // A re-summon reloads the view instead of reusing the last list.
+    root.resetView("")
+    input.text = resumeAi ? root.aiQuery : initial
     input.cursorPosition = input.text.length
     root.selectedIndex = 0
     root.cursorActive = true
@@ -242,6 +462,9 @@ Item {
     root.suggestionFor = ""
     root.fileRows = []
     root.fileFor = ""
+    root.clipboardRows = []
+    root.clipboardFor = ""
+    root.tldrPage = null
     // The panel appears under wherever the pointer already is. Hold the cursor
     // for the same beat a keystroke would, so opening over a row does not hand
     // it the selection before the first character is typed.
@@ -253,34 +476,70 @@ Item {
     // up an edit just as promptly.
     root.refreshSettings()
     root.refreshReminders()
+    root.refreshToggleStates()
+    root.syncView(Query.parse(root.query).filter)
+    root.updateCurrency()
     root.rebuild()
+    if (resumeAi) {
+      aiPanel.restoringScroll = true
+      root.aiActive = true
+      aiPanel.restoreScroll(root.aiReadPosition)
+    }
     pointerGate.reset()
+    if (root.setupPending() || (tour.started && !tour.singleStep)) root.resumeTour()
     Qt.callLater(function() {
-      input.forceActiveFocus()
+      if (!root.opened) return
+      if (root.tourActive) tour.focusStep()
+      else input.forceActiveFocus()
       resultList.positionViewAtBeginning()
     })
   }
 
   function close() {
+    // dismiss() closes before asking the shell to hide, and the shell calls
+    // close() again; the second call has nothing left to stop.
+    if (!root.opened) return
     root.opened = false
+    if (root.settingsActive) root.flushSettings()
+    if (root.presentationProgress === 0) root.finishClose()
+  }
+
+  // Keep the last layout until it is transparent; reopening cancels cleanup.
+  function finishClose() {
+    if (root.opened) return
     root.armedKey = ""
+    root.leaveSettingsPanel()
     root.stopQueryWork()
   }
 
-  // Nothing that was started for a query outlives the overlay it was typed
-  // into: the debounces stop, the readers are terminated, and the rows they
-  // were filling are dropped rather than left resident.
+  // Search readers belong to the visible query. An explicitly submitted AI
+  // request belongs to the shell session and can finish while Spotlight is hidden.
   function stopQueryWork() {
+    root.pendingCurrency = null
+    Currency.cancel(root.currencySession)
+    currencyDebounce.stop()
+    root.stopCurrencyProcess()
     suggestDebounce.stop()
     fileDebounce.stop()
     clipboardDebounce.stop()
+    tldrDebounce.stop()
     suggestProc.running = false
     fileProc.running = false
     clipboardProc.running = false
+    tldrProc.running = false
+    root.resetFolders()
+    previewDebounce.stop()
+    root.stopPreviewProcess()
+    root.preview = null
+    root.previewData = null
+    root.resetView("")
     root.clipboardRows = []
+    root.clipboardFor = ""
+    root.tldrPage = null
   }
 
   function refreshSettings() {
+    root.settingsReadStale = false
     settingsProc.running = false
     settingsProc.command = root.helperArgv(["read-settings"])
     settingsProc.running = true
@@ -321,29 +580,47 @@ Item {
   function loadMenuCommands(raw) {
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.commands)) ? reply.commands : []
+    // The menu tree carries actions the catalogue already curates, only under
+    // the menu's own wording, so the merged list showed both. The catalogue
+    // copy wins: it is the one with the hand-written subtitle, the keywords
+    // and, for a toggle, the state the switch reads.
+    var known = {}
+    var catalogue = Commands.commands()
+    for (var k = 0; k < catalogue.length; k++) {
+      var id = Commands.argvId(catalogue[k].argv)
+      if (id) known[id] = true
+    }
     var out = []
     for (var i = 0; i < list.length; i++) {
       var c = list[i]
       if (!c || !Array.isArray(c.argv) || c.argv.length === 0) continue
       var argv = []
       for (var j = 0; j < c.argv.length; j++) argv.push(String(c.argv[j]))
+      if (known[Commands.argvId(argv)]) continue
       out.push({
         key: String(c.key || ""),
         title: String(c.title || "").slice(0, root.maxTitleChars),
         subtitle: String(c.subtitle || "").slice(0, root.maxSubtitleChars),
         icon: String(c.icon || "󰣇"),
         kind: "shell",
-        // Dispatch is still plain "shell" (activate()'s switch never sees
-        // this), but commandRows() reads it to label these distinctly from
-        // the hand-curated catalogue - these are real Omarchy menu tree
-        // entries, not entries this project wrote, and looking identical
-        // to a curated command made that distinction invisible.
-        source: "menu",
         argv: argv,
         keywords: String(c.keywords || "")
       })
     }
     root.menuCommands = out
+  }
+
+  function refreshPluginCommands() {
+    root.pluginCommands = []
+    pluginsProc.running = false
+    pluginsProc.command = root.helperArgv(["read-plugins"])
+    pluginsProc.running = true
+  }
+
+  function loadPluginCommands(raw) {
+    var reply = root.helperReply(raw)
+    root.pluginCommands = Commands.fromPlugins(reply ? reply.plugins : [], root.pluginId)
+    if (root.opened) root.rebuild()
   }
 
   function refreshReminders() {
@@ -352,34 +629,250 @@ Item {
     remindersProc.running = true
   }
 
+  function refreshToggleStates() {
+    toggleStatesProc.running = false
+    toggleStatesProc.command = root.helperArgv(["toggle-states"])
+    toggleStatesProc.running = true
+  }
+
+  function loadToggleStates(raw) {
+    var reply = root.helperReply(raw)
+    var states = (reply && reply.states && typeof reply.states === "object") ? reply.states : {}
+    var out = ({})
+    for (var id in states)
+      if (states[id] === true || states[id] === false) out[id] = states[id]
+    root.toggleStates = out
+  }
+
+  // The label under the cursor names what Enter will do, so a toggle row says
+  // which way it is about to go rather than a generic "Run".
+  function primaryLabelFor(r) {
+    var id = (r && r.payload) ? r.payload.stateId : ""
+    if (id && root.toggleStates[id] !== undefined)
+      return root.toggleStates[id] === true ? "Turn off" : "Turn on"
+    return r ? r.primaryLabel : ""
+  }
+
   // Escape and successful activations go through here so the shell's
   // openPanelIds stays in step — otherwise the next toggle would try to hide
   // an overlay that is already gone.
   function dismiss() {
-    root.opened = false
-    root.armedKey = ""
+    root.close()
     if (root.shell && typeof root.shell.hide === "function") root.shell.hide(root.pluginId)
   }
 
   function toggle() {
+    // The current shortcut pressed while the recorder step is up: show it as
+    // "already your shortcut" instead of closing the tour.
+    if (root.opened && root.tourActive && tour.step === 1) {
+      tour.selected = root.tourBinding.current
+      return
+    }
     if (root.opened) root.dismiss()
     else root.open("{}")
   }
 
-  // ------------------------------------------------------------- usage
-  // Only keys that still mean the same thing next week are worth remembering.
-  // A web suggestion, a file hit or a window is spelled out of the query that
-  // produced it and is never looked up again, so counting one only grows the
-  // file.
-  function trackable(key) {
-    var k = String(key || "")
-    return k.indexOf("app:") === 0 || k.indexOf("cmd:") === 0 || k.indexOf("bang.") === 0
+  // The file still says first run until the tour's queued write lands; the
+  // queue already knows better.
+  function setupPending() {
+    return root.settings.setupCompleted === false
+      && root.settingsWrites.pending.setupCompleted !== true
+      && root.settingsWrites.active.setupCompleted !== true
   }
 
-  function bumpUsage(key) {
-    if (!root.trackable(key)) return
+  // Re-raise an unfinished tour at the step the user left; fresh start otherwise.
+  function resumeTour() {
+    if (tour.started && !tour.singleStep) {
+      root.tourActive = true
+      root.readBinding()
+      tour.focusStep()
+    } else root.showTour(0, false)
+  }
+
+  // ------------------------------------------------------- maintenance
+  function editSettingsFile() {
+    root.dismiss()
+    root.editAfterSave = true
+    root.openEditorWhenSaved()
+  }
+
+  // The editor must show the file with the panel's last edits in it. A failed
+  // write will not land by itself, so it does not hold the editor back.
+  function openEditorWhenSaved() {
+    var writes = root.settingsWrites
+    if (!root.editAfterSave || Object.keys(writes.active).length
+        || (Object.keys(writes.pending).length && !writes.failed)) return
+    root.editAfterSave = false
+    maintenanceProc.running = false
+    maintenanceProc.action = "settings"
+    maintenanceProc.command = root.helperArgv(["ensure-settings"])
+    maintenanceProc.running = true
+  }
+
+  function openDataFolder() {
+    maintenanceProc.running = false
+    maintenanceProc.action = "data"
+    maintenanceProc.command = root.helperArgv(["ensure-data"])
+    maintenanceProc.running = true
+  }
+
+  function resetLearning() {
+    root.pendingUsage = ""
+    usageReadProc.running = false
+    usageWriteProc.running = false
+    maintenanceProc.running = false
+    maintenanceProc.action = "reset"
+    maintenanceProc.command = root.helperArgv(["reset-usage"])
+    maintenanceProc.running = true
+  }
+
+  // ------------------------------------------------------- settings panel
+  function showSettingsPanel() {
+    input.text = ""
+    root.armedKey = ""
+    root.tourActive = false
+    root.settingsActive = true
+    root.readBinding()
+    settingsPanel.open()
+  }
+
+  // Flush edits on every exit.
+  function leaveSettingsPanel() {
+    if (!root.settingsActive) return
+    root.settingsActive = false
+    root.flushSettings()
+  }
+
+  function closeSettingsPanel() {
+    root.leaveSettingsPanel()
+    if (root.opened) Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+  function queueSettings(patch) {
+    root.settingsWrites = SettingsQueue.add(root.settingsWrites, patch)
+    settingsWriteDebounce.restart()
+  }
+
+  function flushSettings() {
+    settingsWriteDebounce.stop()
+    if (settingsWriteProc.running) return
+    var next = SettingsQueue.take(root.settingsWrites)
+    if (!next.patch) return
+    root.settingsWrites = next.state
+    settingsWriteProc.stdinEnabled = true
+    settingsWriteProc.command = root.helperArgv(["write-settings"])
+    settingsWriteProc.running = true
+    settingsWriteProc.write(JSON.stringify(next.patch))
+    settingsWriteProc.stdinEnabled = false
+  }
+
+  function completeSettingsWrite(raw) {
+    var reply = root.helperReply(raw)
+    if (reply) {
+      root.settingsSaveError = ""
+      root.settingsReadStale = true
+      root.loadSettings(raw)
+    } else {
+      root.settingsSaveError = root.helperError(raw)
+      if (!root.settingsActive) Util.execArgv(["notify-send", "-u", "critical",
+        "Spotlight settings not saved",
+        (root.settingsSaveError || "Check the file") + ". Reopen Spotlight Settings to retry."])
+    }
+    root.settingsWrites = SettingsQueue.settle(root.settingsWrites, !!reply)
+    if (reply) root.flushSettings()
+    root.openEditorWhenSaved()
+  }
+
+  // ------------------------------------------------------------- tour
+  function showTour(step, single) {
+    input.text = ""
+    root.armedKey = ""
+    root.bindingState = ""
+    root.tourActive = true
+    tour.start(Object.assign({}, root.settings, root.settingsWrites.active,
+                             root.settingsWrites.pending), step, single)
+    root.readBinding()
+  }
+
+  // `patch` holds the settings keys to persist; {} means the tour was only
+  // looked at (single-step Done, or Esc on the shortcut chooser).
+  function finishTour(patch) {
+    root.tourActive = false
+    if (Object.keys(patch || {}).length > 0) {
+      root.queueSettings(patch)
+      root.flushSettings()
+    }
+    if (root.tourFromSettings) {
+      root.tourFromSettings = false
+      root.showSettingsPanel()
+    } else Qt.callLater(function() { input.forceActiveFocus() })
+  }
+
+  function readBinding() {
+    bindingProc.running = false
+    bindingProc.action = "read"
+    bindingProc.command = root.helperArgv(["read-binding"])
+    bindingProc.running = true
+  }
+
+  function writeBinding(chord) {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "write"
+    bindingProc.command = root.helperArgv(["write-binding", chord])
+    bindingProc.running = true
+  }
+
+  function revertBinding() {
+    root.bindingState = "busy"
+    bindingProc.running = false
+    bindingProc.action = "revert"
+    bindingProc.command = root.helperArgv(["revert-binding"])
+    bindingProc.running = true
+  }
+
+  // Chords arrive in two spellings (bindings.lua and the keybindings menu),
+  // so every one is canonicalized before the tour compares them.
+  function loadBinding(reply) {
+    var bound = {}
+    var raw = (reply && reply.bound && typeof reply.bound === "object") ? reply.bound : {}
+    for (var key in raw) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue
+      var chord = Chord.normalize(key)
+      if (chord && !Object.prototype.hasOwnProperty.call(bound, chord))
+        bound[chord] = String(raw[key]).slice(0, 80)
+    }
+    var unknownMods = (reply && Array.isArray(reply.unknownMods)) ? reply.unknownMods : null
+    root.tourBinding = {
+      current: Chord.normalize(reply && reply.current ? reply.current : ""),
+      previous: Chord.normalize(reply && reply.previous ? reply.previous : ""),
+      managed: !!(reply && reply.managed === true),
+      bound: bound,
+      unknownMods: unknownMods
+    }
+    // First run only: claim the recommended chord when Spotlight has no
+    // shortcut and nothing else holds it. Absence from `bound` only means
+    // free where the table can speak: a helper that could not read the live
+    // keybindings answers bound: null, and one that read them but could not
+    // name every bind under a modifier set lists it in unknownMods. Either
+    // way nothing is taken.
+    if (!root.autoBindDone && root.settings.setupCompleted === false) {
+      root.autoBindDone = true
+      if (root.tourBinding.current === ""
+          && Chord.isKnown(root.defaultChord, reply && reply.bound, unknownMods)
+          && !Object.prototype.hasOwnProperty.call(bound, root.defaultChord))
+        root.writeBinding(root.defaultChord)
+    }
+  }
+
+  // ------------------------------------------------------------- usage
+  function bumpUsage(row) {
+    if (!root.settings.learningEnabled || !row || !row.stableId) return
+    if (row.resultType !== "app" && row.resultType !== "window"
+        && row.resultType !== "file" && row.resultType !== "action") return
     var now = Date.now()
-    var next = Frecency.prune(Frecency.bump(root.usage, key, now), root.usageKeepCount, now)
+    var contexts = Query.contextKeys(Query.parse(root.query))
+    var next = Frecency.bump(root.usage, row.stableId, contexts, row.learningMeta, now)
     root.usage = next
     root.persistUsage(JSON.stringify(next))
   }
@@ -391,7 +884,7 @@ Item {
     // the second half of the same guarantee: on an ordinary object a key of
     // `__proto__` is an assignment to the prototype rather than an entry, so
     // one such line in the file would quietly reshape every lookup after it.
-    root.usage = Frecency.adopt(reply ? reply.usage : null)
+    root.usage = Frecency.adopt(reply ? reply.usage : null, Date.now())
   }
 
   // Writes go through the helper too: a locked, atomic 0600 replacement inside
@@ -415,33 +908,165 @@ Item {
     usageWriteProc.stdinEnabled = false
   }
 
-  // Settings arrive already type-checked and clamped. The one thing the helper
-  // cannot judge is whether the engine key names an engine that exists, so
-  // that is settled here against the table that will be asked for it.
+  // Settings arrive type-checked and clamped. Engine and currency membership
+  // are checked here against the catalogs used by their providers.
   function loadSettings(raw) {
     var reply = root.helperReply(raw)
+    if (reply && reply.aiModels) root.aiModels = reply.aiModels
     var parsed = (reply && reply.settings) ? reply.settings : {}
+    var oldCurrency = root.settings.defaultCurrency
+    var oldRates = root.settings.currencyRates
+    var oldAi = root.settings.aiEnabled === true
+    var oldAiProvider = root.settings.aiProvider === "codex" ? "codex" : "claude"
     root.settings = {
       showAppIcons: parsed.showAppIcons === true,
       webSuggestions: parsed.webSuggestions === true,
-      searchEngine: Web.hasEngine(parsed.searchEngine) ? parsed.searchEngine : "g",
+      currencyRates: parsed.currencyRates !== false,
+      searchEngine: Web.canonicalEngine(parsed.searchEngine),
+      defaultCurrency: Currency.defaultCode(parsed.defaultCurrency),
       fileSearch: parsed.fileSearch !== false,
-      fileSearchAlways: parsed.fileSearchAlways === true,
+      fileSearchAlways: parsed.fileSearchAlways !== false,
+      clipboardSearch: parsed.clipboardSearch !== false,
+      clipboardSearchAlways: parsed.clipboardSearchAlways !== false,
+      previewPane: parsed.previewPane !== false,
+      reduceMotion: parsed.reduceMotion === true,
+      learningEnabled: parsed.learningEnabled !== false,
+      aiEnabled: parsed.aiEnabled === true,
+      aiProvider: parsed.aiProvider === "codex" ? "codex" : "claude",
+      aiModel: typeof parsed.aiModel === "string" ? parsed.aiModel : "",
+      aiEffort: typeof parsed.aiEffort === "string" ? parsed.aiEffort : "",
+      aiWebSearch: parsed.aiWebSearch === true,
+      artifactSettings: parsed.artifactSettings || ({ weather: { defaultLocation: "" } }),
+      maxResults: isFinite(parsed.maxResults)
+        ? Util.clamp(parsed.maxResults, 8, root.maxGlobalResults) : 20,
       maxApps: isFinite(parsed.maxApps)
         ? Util.clamp(parsed.maxApps, 3, root.maxAppRows) : 8,
       maxSuggestions: isFinite(parsed.maxSuggestions)
-        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4
+        ? Util.clamp(parsed.maxSuggestions, 0, 8) : 4,
+      verticalPosition: isFinite(parsed.verticalPosition)
+        ? Util.clamp(parsed.verticalPosition, 0, 100) : 50,
+      horizontalPosition: isFinite(parsed.horizontalPosition)
+        ? Util.clamp(parsed.horizontalPosition, 0, 100) : 50,
+      setupCompleted: parsed.setupCompleted !== false
     }
+    // First run: the flag usually lands after open() has already drawn the
+    // search card, so the tour is raised from here as well.
+    if (root.opened && !root.tourActive && !root.settingsActive && root.setupPending())
+      root.resumeTour()
+    // resumeTour has just read the binding when the launcher is open; only
+    // a closed launcher needs a read of its own.
+    if (root.settings.setupCompleted === false && !root.autoBindDone && !root.tourActive)
+      root.readBinding()
+    if (root.opened && (oldCurrency !== root.settings.defaultCurrency
+        || oldRates !== root.settings.currencyRates)) {
+      root.pendingCurrency = null
+      if (oldRates !== root.settings.currencyRates) {
+        Currency.cancel(root.currencySession)
+        currencyDebounce.stop()
+        root.stopCurrencyProcess()
+      }
+      root.updateCurrency()
+      if (root.currencyQuery(Query.parse(root.query).text)) {
+        suggestDebounce.stop()
+        suggestProc.running = false
+        root.suggestionRows = []
+        root.suggestionFor = ""
+      }
+      root.rebuild()
+    }
+    if (oldAi && !root.settings.aiEnabled) root.stopAi()
+    if (root.opened && (oldAi !== root.settings.aiEnabled
+        || oldAiProvider !== root.settings.aiProvider)) {
+      root.rebuild()
+    }
+  }
+
+  function currencyQuery(text) {
+    return Currency.parse(text, root.settings.defaultCurrency)
+  }
+
+  function stopAi() {
+    root.aiGeneration += 1
+    if (root.aiProcess) root.aiProcess.running = false
+    root.aiProcess = null
+    root.aiActive = false
+    root.aiBusy = false
+    root.aiError = ""
+    root.aiProgress = ""
+    root.aiResult = null
+    root.aiQuery = ""
+  }
+
+  function notifyAiFinished(succeeded) {
+    if (root.opened && root.aiActive && !root.settingsActive && !root.tourActive) return
+    Util.execArgv(["omarchy", "notification", "send", "--app-name", "Spotlight", "-g", "󰊠", "-u", "low",
+      succeeded ? "Spotlight answer is ready" : "Spotlight AI could not finish",
+      succeeded ? "Open Spotlight to read your answer." : "Open Spotlight to review the error.",
+      "--exec", "omarchy-shell", "shell", "summon", root.pluginId, "{}"])
+  }
+
+  function failAi(message) {
+    root.aiBusy = false
+    root.aiError = message
+    root.notifyAiFinished(false)
+  }
+
+  function startAi() {
+    var parsed = Query.parse(root.query)
+    if (!root.settings.aiEnabled || parsed.filter !== "ai" || !parsed.text) return
+    root.aiReadPosition = 0
+    root.stopAi()
+    root.aiQuery = root.query
+    root.aiActive = true
+    root.aiBusy = true
+    var run = aiProcessComponent.createObject(root, { generation: root.aiGeneration })
+    if (!run) {
+      root.aiBusy = false
+      root.aiError = "Could not start AI"
+      return
+    }
+    root.aiProcess = run
+    run.stdinEnabled = true
+    var weatherRequest = WeatherIntent.isWeather(parsed.text)
+    var weatherLocation = root.settings.aiWebSearch && weatherRequest
+      ? ((root.settings.artifactSettings || {}).weather || {}).defaultLocation || "" : ""
+    run.command = root.helperArgv(["ai", root.settings.aiProvider,
+      root.settings.aiModel, root.settings.aiEffort, root.settings.aiWebSearch ? "true" : "false",
+      weatherLocation, weatherRequest ? "true" : "false"])
+    run.running = true
+    run.write(parsed.text)
+    run.stdinEnabled = false
+  }
+
+  function handleAiLine(raw, generation) {
+    if (generation !== root.aiGeneration || !root.aiBusy) return false
+    var reply = root.helperReply(raw)
+    if (!reply) {
+      root.failAi(root.helperError(raw) || "AI did not return an answer")
+      return true
+    }
+    if (reply.event === "progress" && typeof reply.text === "string") {
+      root.aiProgress = (root.aiProgress + reply.text).slice(-2400)
+      return false
+    }
+    if (reply.event === "result" && reply.result) {
+      root.aiBusy = false
+      root.aiResult = reply.result
+      root.aiReadPosition = 0
+      root.notifyAiFinished(true)
+      return true
+    }
+    return false
   }
 
   // ------------------------------------------------------------- providers
   function row(spec) {
     return {
       key: String(spec.key || "").slice(0, 2048),
-      section: String(spec.section || "").slice(0, 128),
       kind: String(spec.kind || "noop").slice(0, 32),
       title: String(spec.title || "").slice(0, root.maxTitleChars),
       subtitle: String(spec.subtitle || "").slice(0, root.maxSubtitleChars),
+      section: String(spec.section || "").slice(0, root.maxTitleChars),
       accessory: String(spec.accessory || "").slice(0, 128),
       icon: String(spec.icon || "").slice(0, 128),
       image: String(spec.image || "").slice(0, 2048),
@@ -449,41 +1074,79 @@ Item {
       primaryLabel: spec.primaryLabel || "Open",
       secondaryLabel: spec.secondaryLabel || "",
       confirm: spec.confirm === true,
+      keywords: String(spec.keywords || "").slice(0, 2048),
+      matchText: String(spec.matchText || ""),
+      resultType: String(spec.resultType || "intent"),
+      stableId: String(spec.stableId || "").slice(0, 512),
+      textMatch: isFinite(spec.textMatch) ? Number(spec.textMatch) : -1,
+      recencyBonus: 0,
+      frequencyBonus: 0,
+      contextBonus: 0,
+      tieRank: isFinite(spec.tieRank) ? Number(spec.tieRank) : NaN,
+      learningMeta: spec.learningMeta || null,
       payload: spec.payload || ({})
     }
   }
 
   // Calculator, unit conversion, reminders, calendar, URLs and bangs. These
   // are the rows that answer the query directly, so they sort above search.
-  function intentRows(q) {
+  function intentRows(q, filter) {
     var out = []
 
-    var calc = Calc.evaluate(q)
+    var calc = (!filter || filter === "calc") ? Calc.evaluate(q) : null
     if (calc) {
       out.push(root.row({
-        key: "calc", section: "Calculator", kind: "copy",
+        key: "calc", kind: "copy",
         title: calc.text, subtitle: q.replace(/^=/, "").trim(),
-        accessory: "Copy", icon: "󰃬", mono: true,
+        accessory: "Calculator", icon: "󰃬", mono: true,
         primaryLabel: "Copy result",
-        payload: { text: calc.text.replace(/\s/g, "") }
+        payload: { text: calc.text.replace(/\s/g, ""), value: calc.value }
       }))
     }
 
-    var unit = Units.convert(q)
+    var unit = (!filter || filter === "unit") ? Units.convert(q) : null
     if (unit) {
       out.push(root.row({
-        key: "unit", section: "Conversion", kind: "copy",
+        key: "unit", kind: "copy",
         title: unit.text, subtitle: unit.detail,
-        accessory: unit.family, icon: "󰑤", mono: true,
+        accessory: "Conversion", icon: "󰑤", mono: true,
         primaryLabel: "Copy result",
-        payload: { text: unit.text.replace(/\s/g, "") }
+        payload: { text: unit.text.replace(/\s/g, ""), related: Units.related(unit, 5) }
       }))
     }
 
-    var reminder = NaturalTime.parseReminder(q)
+    var currency = (!unit && (!filter || filter === "unit")) ? root.currencyQuery(q) : null
+    if (currency) {
+      var cached = currency.expression ? root.currencySession
+        : Currency.entry(root.currencySession, currency.key)
+      var converted = Currency.result(currency, cached, Date.now(), Units.formatNumber)
+      var waiting = currencyDebounce.running || root.currencySession.request !== null
+      out.push(root.row({
+        key: "currency", kind: converted ? "copy" : waiting ? "currency-wait" : "noop",
+        title: converted ? converted.text : (waiting ? "Loading exchange rate…" : "Exchange rate unavailable"),
+        subtitle: converted ? converted.detail : (currency.expression ? currency.source
+          : currency.base) + " → " + currency.quote + " · Frankfurter",
+        accessory: "Currency", section: "Conversions", icon: "󰑤", mono: true,
+        primaryLabel: converted ? "Copy result" : waiting ? "Copy when ready" : "",
+        payload: converted ? {
+          text: converted.copy, amount: currency.amount, base: currency.base || "",
+          quote: currency.quote, expression: !!currency.expression,
+          source: currency.expression ? currency.source
+            : Units.formatNumber(currency.amount) + " " + currency.base,
+          rate: !currency.expression && cached && cached.rate ? cached.rate.rate
+            : (currency.base === currency.quote ? 1 : NaN),
+          date: !currency.expression && cached && cached.rate ? cached.rate.date : "",
+          steps: currency.expression ? Currency.steps(currency, root.currencySession) : null
+        } : ({})
+      }))
+    }
+
+    var reminderText = filter === "reminder" ? "reminder " + q : q
+    var reminder = (!filter || filter === "reminder")
+      ? NaturalTime.parseReminder(reminderText) : null
     if (reminder && !reminder.needsTime && reminder.message) {
       out.push(root.row({
-        key: "reminder.create", section: "Reminder", kind: "reminder",
+        key: "reminder.create", kind: "reminder",
         title: reminder.message,
         subtitle: "Notify " + reminder.label + " · in " + NaturalTime.formatDuration(reminder.minutes),
         accessory: "Reminder", icon: "󰢌",
@@ -492,7 +1155,7 @@ Item {
       }))
     } else if (reminder && reminder.needsTime) {
       out.push(root.row({
-        key: "reminder.hint", section: "Reminder", kind: "noop",
+        key: "reminder.hint", kind: "noop",
         title: reminder.message || "Set a reminder",
         subtitle: "Add a time — “in 20m”, “at 15:30”, “tomorrow at 9”",
         accessory: "Needs a time", icon: "󰢌",
@@ -500,34 +1163,51 @@ Item {
       }))
     }
 
-    var event = NaturalTime.parseEvent(q)
+    var eventText = filter === "calendar" ? "event " + q : q
+    var event = (!filter || filter === "calendar") ? NaturalTime.parseEvent(eventText) : null
     if (event) {
       out.push(root.row({
-        key: "event.create", section: "Calendar", kind: "event",
+        key: "event.create", kind: "event",
         title: event.title,
-        subtitle: event.label + " · " + NaturalTime.formatDuration(event.durationMinutes),
-        accessory: "Google Calendar", icon: "󰸗",
+        subtitle: event.label + " · " + (event.allDay ? "All day" : NaturalTime.formatDuration(event.durationMinutes)),
+        accessory: "Calendar", icon: "󰸗",
         primaryLabel: "Add to Google Calendar",
         secondaryLabel: "Save .ics file",
         payload: {
           title: event.title,
-          start: NaturalTime.toUtcBasic(event.start),
-          end: NaturalTime.toUtcBasic(event.end)
+          allDay: event.allDay === true,
+          // An all-day event travels as a plain date on both sides; DTEND and
+          // the Google range are exclusive, which is why end is the next day.
+          start: event.allDay ? NaturalTime.toDateBasic(event.start) : NaturalTime.toUtcBasic(event.start),
+          end: event.allDay ? NaturalTime.toDateBasic(event.end) : NaturalTime.toUtcBasic(event.end),
+          stamp: NaturalTime.toUtcBasic(event.start)
         }
       }))
     }
 
-    var url = Web.detectUrl(q)
+    var url = (!filter || filter === "web") ? Web.detectUrl(q) : ""
     if (url) {
-      out.push(root.row({
-        key: "url.open", section: "Open", kind: "url",
-        title: url.replace(/^https?:\/\//, ""), subtitle: url,
-        accessory: "Website", icon: "󰖟",
-        primaryLabel: "Open in browser",
-        payload: { url: url }
-      }))
+      var isJam = Web.isSpotifyJamUrl(url)
+      if (isJam) {
+        out.push(root.row({
+          key: "url.jam", kind: "spotifyjam",
+          title: "Open Spotify Jam", subtitle: "Convert and join the Jam in Spotify",
+          accessory: "Spotify", icon: "󰓇",
+          primaryLabel: "Open Jam in Spotify",
+          payload: { url: url }
+        }))
+      } else {
+        out.push(root.row({
+          key: "url.open", kind: "url",
+          title: url.replace(/^https?:\/\//, ""), subtitle: url,
+          accessory: "Web", icon: "󰖟",
+          primaryLabel: "Open in browser",
+          payload: { url: url }
+        }))
+      }
     }
 
+    for (var i = 0; i < out.length; i++) out[i].textMatch = Fuzzy.MATCH_EXACT
     return out
   }
 
@@ -539,25 +1219,34 @@ Item {
   function bangRows(q) {
     var bang = Web.bang(q)
     if (!bang) return []
+    // "tr … to german" drops the target off the end of the query, so the row has
+    // to show what is actually going to be translated and where it is going.
+    var target = bang.key === "tr" ? Web.translation(bang.query) : null
+    var text = target ? target.text : bang.query
+    var label = target ? "Translate to " + target.name : "Search " + bang.engine.name
     return [root.row({
-      key: "bang." + bang.key, section: "Search", kind: "url",
-      title: bang.query, subtitle: "Search " + bang.engine.name,
-      accessory: bang.engine.name, icon: bang.engine.icon,
-      primaryLabel: "Search " + bang.engine.name,
+      key: "bang." + bang.key, kind: "url",
+      title: text, subtitle: label,
+      accessory: "Web", icon: bang.engine.icon,
+      primaryLabel: label,
+      matchText: text,
+      resultType: "web",
       payload: { url: Web.searchUrl(bang.query, bang.key) }
     })]
   }
 
-  // Both sources answer with the same [{entry, score}] shape, so nothing below
-  // has to know which one produced the list.
+  // The public plugin API exposes visibility through sortedEntries("").
+  // Match locally so generated web-app IDs cannot leak into search results.
   function appEntries(q) {
-    if (root.appLibrary) {
-      var ranked = root.appLibrary.sortedEntries(q) || []
-      return ranked.slice(0, root.maxAppCandidates)
-    }
     var values = []
-    try { values = DesktopEntries.applications.values || [] } catch (e) { return [] }
-    return Apps.sortedEntries(values, q, root.appHides,
+    var hidden = null
+    if (root.appLibrary) {
+      values = root.appLibrary.sortedEntries("").map(function(row) { return row.entry })
+    } else {
+      try { values = DesktopEntries.applications.values || [] } catch (e) { return [] }
+      hidden = root.appHides
+    }
+    return Apps.sortedEntries(values, q, hidden,
       root.maxAppCandidates, root.maxAppCandidates * 8)
   }
 
@@ -567,21 +1256,6 @@ Item {
 
   function appSubtext(entry) {
     return root.appLibrary ? root.appLibrary.entrySubtext(entry) : Apps.entrySubtext(entry)
-  }
-
-  function isWebApp(entry) {
-    if (!entry) return false
-    var exec = String(entry.exec || "")
-    if (exec.indexOf("omarchy-launch-webapp") !== -1 || exec.indexOf("omarchy-webapp-handler") !== -1 || exec.indexOf("webapp") !== -1) {
-      return true
-    }
-    var id = String(entry.id || "").toLowerCase()
-    if (id.indexOf("webapp") !== -1) return true
-    var comment = String(entry.comment || "").toLowerCase()
-    if (comment.indexOf("web app") !== -1) return true
-    var generic = String(entry.genericName || "").toLowerCase()
-    if (generic.indexOf("web app") !== -1) return true
-    return false
   }
 
   // AppLibrary keeps its own index of icons installed after the shell started,
@@ -612,54 +1286,53 @@ Item {
     Util.execArgv(["uwsm-app", "--", "gtk-launch", id + ".desktop"])
   }
 
-  function appRows(q) {
+  // Omarchy web apps launch through omarchy-launch-webapp; label them apart
+  // from native apps (lunardi0x01).
+  function isWebApp(entry) {
+    if (!entry) return false
+    var exec = String(entry.execString || entry.exec || "")
+    if (exec.indexOf("omarchy-launch-webapp") !== -1 || exec.indexOf("omarchy-webapp-handler") !== -1 || exec.indexOf("webapp") !== -1) return true
+    if (String(entry.id || "").toLowerCase().indexOf("webapp") !== -1) return true
+    if (String(entry.comment || "").toLowerCase().indexOf("web app") !== -1) return true
+    return String(entry.genericName || "").toLowerCase().indexOf("web app") !== -1
+  }
+
+  function appRows(q, learnedOnly) {
     var entries = root.appEntries(q)
-    var now = Date.now()
-    var candidates = []
+    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxAppCandidates
+    var out = []
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i].entry
       var key = "app:" + String(entry.id || "")
-      // sortedEntries scored the match as well as ordering it, and keeping
-      // that number instead of the position is what lets frecency stay a
-      // bounded bonus. Flattened to a rank position, "the name starts with the
-      // query" and "one letter of the acronym matched" sit a single point
-      // apart, so any usage at all was enough to swap them.
-      candidates.push({
-        key: key,
-        entry: entry,
-        order: i,
-        score: (q ? (Number(entries[i].score) || 0) : 0)
-          + Frecency.weight(root.usage[key], now) * (q ? root.appFrecencyBoost : root.idleFrecencyBoost)
-      })
-    }
-    candidates.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
-    })
-
-    var limit = q ? Util.clamp(root.settings.maxApps, 3, root.maxAppRows) : root.maxIdleAppRows
-    var out = []
-    for (var j = 0; j < candidates.length && out.length < limit; j++) {
-      var c = candidates[j]
-      var isWeb = root.isWebApp(c.entry)
+      if (learnedOnly && !Frecency.hasItem(root.usage, key)) continue
+      var isWebApp = root.isWebApp(entry)
       out.push(root.row({
-        key: c.key,
-        section: "Applications", kind: "app",
-        title: root.appName(c.entry),
-        subtitle: root.appSubtext(c.entry),
-        accessory: isWeb ? "Web App" : "Application",
-        icon: isWeb ? "󰖟" : "󰀻",
-        image: (root.settings && root.settings.showAppIcons) ? root.appIcon(c.entry.icon) : "",
+        key: key,
+        kind: "app",
+        title: root.appName(entry),
+        subtitle: root.appSubtext(entry),
+        accessory: isWebApp ? "Web App" : "App",
+        icon: isWebApp ? "󰖟" : "󰀻",
+        image: root.settings.showAppIcons ? root.appIcon(entry.icon) : "",
         primaryLabel: "Open",
-        payload: { appId: String(c.entry.id || ""), name: root.appName(c.entry) }
+        keywords: Apps.entrySearchText(entry),
+        resultType: "app",
+        stableId: key,
+        payload: {
+          appId: String(entry.id || ""), name: root.appName(entry),
+          icon: root.appIcon(entry.icon),
+          comment: String(entry.comment || entry.genericName || "").slice(0, 512),
+          exec: String(entry.execString || "").slice(0, 512),
+          categories: (entry.categories || []).slice(0, 8).map(String)
+        }
       }))
+      if (out.length >= limit) break
     }
     return out
   }
 
   // Open windows, so "switch to that Slack window" is one query away.
-  function windowRows(q) {
-    if (!q) return []
+  function windowRows(q, learnedOnly) {
     var candidates = []
     var values = []
     try { values = ToplevelManager.toplevels.values || [] } catch (e) { return [] }
@@ -670,78 +1343,121 @@ Item {
       var title = String(t.title || "").slice(0, root.maxTitleChars)
       var appId = String(t.appId || "").slice(0, 256)
       if (!title && !appId) continue
+      var stableId = appId ? "window:" + appId : ""
+      if (learnedOnly && !Frecency.hasItem(root.usage, stableId)) continue
       candidates.push({
         title: title || appId,
         subtitle: appId,
         keywords: "window switch focus " + appId,
+        stableId: stableId,
         toplevel: t
       })
     }
 
-    var ranked = Fuzzy.rank(candidates, q, 5)
+    var ranked = Fuzzy.rank(candidates, q, root.maxGlobalResults)
     var out = []
     for (var j = 0; j < ranked.length; j++) {
       out.push(root.row({
         key: "win:" + ranked[j].subtitle + ":" + ranked[j].title,
-        section: "Open Windows", kind: "window",
+        kind: "window",
         title: ranked[j].title, subtitle: ranked[j].subtitle,
         accessory: "Window", icon: "󰖯",
         primaryLabel: "Focus window",
         secondaryLabel: "Close window",
+        keywords: ranked[j].keywords,
+        resultType: "window",
+        stableId: ranked[j].stableId,
         payload: { toplevel: ranked[j].toplevel }
       }))
     }
     return out
   }
 
-  function commandRows(q) {
-    if (!q) return []
-    var catalogue = Commands.commands().concat(Commands.quicklinks()).concat(root.menuCommands)
-    var ranked = Fuzzy.rank(catalogue, q, 40)
-
-    // Usage reorders within the matched set without overriding a strong
-    // title match, hence the bonus being added to the fuzzy score.
-    var now = Date.now()
-    var scored = []
-    for (var i = 0; i < ranked.length; i++) {
-      var key = "cmd:" + ranked[i].key
-      scored.push({
-        cmd: ranked[i],
-        score: Fuzzy.score(ranked[i], q) + Frecency.weight(root.usage[key], now) * root.commandFrecencyBoost,
-        order: i
-      })
-    }
-    scored.sort(function(a, b) {
-      if (b.score !== a.score) return b.score - a.score
-      return a.order - b.order
+  function commandRows(q, actionsOnly, learnedOnly) {
+    var catalogue = Commands.commands().concat(Commands.quicklinks()).concat(root.menuCommands).concat(root.pluginCommands)
+    if (actionsOnly) catalogue = catalogue.filter(function(c) { return c.kind !== "url" })
+    if (learnedOnly) catalogue = catalogue.filter(function(c) {
+      return c.kind !== "url" && Frecency.hasItem(root.usage, "action:" + c.key)
     })
+    var ranked = Fuzzy.rank(catalogue, q, root.maxAppCandidates)
 
     var out = []
-    for (var j = 0; j < scored.length && j < 7; j++) {
-      var c = scored[j].cmd
-      var fromMenu = c.source === "menu"
+    for (var j = 0; j < ranked.length && j < root.maxAppCandidates; j++) {
+      var c = ranked[j]
+      var isWeb = c.kind === "url"
+      var isPlugin = c.kind === "summon" && c.key.indexOf("plugin:") === 0
       out.push(root.row({
         key: "cmd:" + c.key,
-        // Real Omarchy menu tree entries get their own section/badge -
-        // "Command" implied this project wrote and curated every one of
-        // them, which stopped being true once the actual menu tree (275+
-        // entries) got pulled in alongside the ~50 hand-curated ones.
-        section: c.kind === "url" ? "Quicklinks" : (fromMenu ? "Omarchy Menu" : "Commands"),
         kind: c.kind,
         title: c.title, subtitle: c.subtitle,
-        accessory: c.kind === "url" ? "Link" : (fromMenu ? "Menu" : "Command"),
-        icon: (c.kind === "shell" || fromMenu) ? "󰩹" : (c.kind === "url" ? "󰖟" : (c.icon || "󰩹")),
-        primaryLabel: c.kind === "url" ? "Open in browser" : "Run",
+        accessory: isWeb ? "Web" : (isPlugin ? "Plugin" : "Action"),
+        icon: isWeb ? "󰖟" : (c.kind === "shell" ? "󰩹" : (c.icon || "󰩹")),
+        primaryLabel: isWeb ? "Open in browser" : (isPlugin ? "Open" : "Run"),
+        secondaryLabel: c.secondaryLabel,
         confirm: c.confirm === true,
-        payload: { argv: c.argv || [], id: c.id || "", url: c.url || "" }
+        keywords: c.keywords,
+        resultType: isWeb ? "web" : "action",
+        stableId: isWeb ? "" : "action:" + c.key,
+        payload: {
+          argv: c.argv || [], id: c.id || "", url: c.url || "",
+          stateId: c.state || ""
+        }
       }))
     }
     return out
   }
 
-  function clipboardQuery(q) {
-    var m = String(q || "").match(/^(?:cb|clip|clipboard)\s+(\S.*)$/i)
-    return m ? m[1].trim() : ""
+  // A tldr page keeps its own order: every row scores as an exact match, so
+  // ranking falls through to tieRank, which is the position on the page.
+  function tldrResultRows() {
+    var page = root.tldrPage
+    if (!page) return []
+    var out = []
+    function push(spec) {
+      spec.accessory = "tldr"
+      spec.section = spec.section || "Command help"
+      spec.textMatch = Fuzzy.MATCH_EXACT
+      spec.tieRank = out.length
+      out.push(root.row(spec))
+    }
+    if (page.found !== true) {
+      push({ key: "tldr.none", kind: "noop", icon: "󰋼", primaryLabel: "",
+             title: "No tldr page for “" + page.page + "”" })
+      return out
+    }
+    push({ key: "tldr.head", kind: "noop", icon: "󰋼", primaryLabel: "",
+           title: page.title, subtitle: page.description })
+    var examples = page.examples
+    for (var i = 0; i < examples.length; i++) {
+      // Each example sits under its own description heading, so the row is the command alone.
+      push({ key: "tldr.ex:" + i, kind: "copy", icon: "󰆍", mono: true,
+             section: examples[i].description, title: examples[i].command,
+             primaryLabel: "Copy command", secondaryLabel: "Open in terminal",
+             payload: { text: examples[i].command } })
+    }
+    if (page.url) push({ key: "tldr.url", kind: "url", icon: "󰖟", section: "More information",
+                         title: page.url, payload: { url: String(page.url) } })
+    return out
+  }
+
+  // lib/Views.js builds and ranks the rows; this only fills in row defaults.
+  function viewResultRows(name, q) {
+    var specs = Views.rows(name, Query.viewDetails(name),
+      { state: root.viewState, entries: root.viewRows, partial: root.viewPartial }, q, Fuzzy.match)
+    var out = []
+    for (var i = 0; i < specs.length; i++) out.push(root.row(specs[i]))
+    return out
+  }
+
+  function clipboardSearchTarget(q) {
+    if (!root.settings.clipboardSearch) return null
+    var parsed = Query.parse(q)
+    if (parsed.filter === "clipboard")
+      return parsed.empty ? null : { pattern: parsed.text, explicit: true }
+    if (parsed.filter) return null
+    if (root.settings.clipboardSearchAlways && parsed.text.length >= 2)
+      return { pattern: parsed.text, explicit: false }
+    return null
   }
 
   // Only the one-line titles are held here. A clipboard history is the last
@@ -750,17 +1466,19 @@ Item {
   // helper pipes the chosen one straight into wl-copy without it ever crossing
   // back into the shell.
   function clipboardResultRows(q) {
-    var needle = root.clipboardQuery(q)
-    if (!needle) return []
-    var ranked = Fuzzy.rank(root.clipboardRows, needle, root.maxClipboardRows)
+    var target = root.clipboardSearchTarget(q)
+    if (!target || root.clipboardFor !== String(q || "").trim()) return []
+    var ranked = Fuzzy.rank(root.clipboardRows, target.pattern, root.maxClipboardRows)
     var out = []
     for (var i = 0; i < ranked.length; i++) {
       out.push(root.row({
         key: "clip:" + ranked[i].index,
-        section: "Clipboard History", kind: "clipcopy",
+        kind: "clipcopy",
         title: ranked[i].title, subtitle: "",
-        accessory: "Copy", icon: "󰅌", mono: true,
+        accessory: "Clipboard", icon: "󰅌", mono: true,
         primaryLabel: "Copy to clipboard",
+        matchText: target.pattern,
+        resultType: "clipboard",
         payload: { index: ranked[i].index, title: ranked[i].title }
       }))
     }
@@ -771,9 +1489,10 @@ Item {
     if (!/^reminders?$/i.test(String(q || "").trim())) return []
     if (root.reminderRows.length === 0) {
       return [root.row({
-        key: "reminder.none", section: "Reminders", kind: "noop",
+        key: "reminder.none", kind: "noop",
         title: "No active reminders", subtitle: "Try “remind me in 20m to …”",
-        accessory: "", icon: "󰢌", primaryLabel: ""
+        accessory: "", icon: "󰢌", primaryLabel: "",
+        textMatch: Fuzzy.MATCH_EXACT
       })]
     }
     var out = []
@@ -781,17 +1500,19 @@ Item {
       var r = root.reminderRows[i]
       out.push(root.row({
         key: "reminder.active." + i,
-        section: "Reminders", kind: "noop",
+        kind: "noop",
         title: String(r.label || ""),
         subtitle: "in " + String(r.remaining || "") + " · at " + String(r.atTime || ""),
-        accessory: "Active", icon: "󰔟", primaryLabel: ""
+        accessory: "Reminder", icon: "󰔟", primaryLabel: "",
+        textMatch: Fuzzy.MATCH_EXACT
       }))
     }
     out.push(root.row({
-      key: "reminder.clear", section: "Reminders", kind: "shell",
+      key: "reminder.clear", kind: "shell",
       title: "Clear all reminders", subtitle: root.reminderRows.length + " active",
-      accessory: "Command", icon: "󰩹",
-      primaryLabel: "Clear", payload: { argv: ["omarchy", "reminder", "clear"] }
+      accessory: "Action", icon: "󰩹",
+      primaryLabel: "Clear", resultType: "action", stableId: "action:reminder.clear",
+      payload: { argv: ["omarchy", "reminder", "clear"] }
     }))
     return out
   }
@@ -800,36 +1521,93 @@ Item {
     // Results arrive asynchronously. Do not show the previous file query while
     // the helper is still answering the current one.
     if (root.fileFor !== String(q || "").trim() || root.fileRows.length === 0) return []
+    var target = root.fileSearchTarget(q)
+    if (!target) return []
+    var limit = target.implicit
+      ? Math.min(root.maxUnifiedFileRows, Math.max(1, Math.floor(root.settings.maxResults / 2)))
+      : root.maxFileRows
     var out = []
-    for (var i = 0; i < root.fileRows.length && i < root.maxFileRows; i++) {
+    for (var i = 0; i < root.fileRows.length && i < limit; i++) {
       var f = root.fileRows[i]
       out.push(root.row({
         key: "file:" + f.path,
-        section: "Files", kind: "file",
+        kind: "file",
         title: f.name, subtitle: f.dir,
         accessory: f.isDir ? "Folder" : "File",
         icon: f.isDir ? "󰉋" : "󰈔",
         primaryLabel: "Open",
         secondaryLabel: "Open folder",
+        matchText: target.pattern,
+        resultType: "file",
+        stableId: f.id ? "file:" + f.id : "",
+        tieRank: i,
+        learningMeta: { path: f.path, name: f.name, dir: f.dir, isDir: f.isDir },
         payload: { path: f.path, dir: f.dir }
       }))
     }
     return out
   }
 
+  function learnedFileRows() {
+    var out = []
+    var items = root.usage && root.usage.items ? root.usage.items : ({})
+    var ids = Object.keys(items)
+    for (var i = 0; i < ids.length; i++) {
+      var entry = items[ids[i]]
+      var f = entry && entry.meta
+      if (ids[i].indexOf("file:") !== 0 || !f || !f.path) continue
+      out.push(root.row({
+        key: "idle:" + ids[i], kind: "file",
+        title: f.name, subtitle: f.dir,
+        accessory: f.isDir ? "Folder" : "File",
+        icon: f.isDir ? "󰉋" : "󰈔",
+        primaryLabel: "Open", secondaryLabel: "Open folder",
+        resultType: "file", stableId: ids[i], textMatch: 0,
+        learningMeta: f, payload: { path: f.path, dir: f.dir }
+      }))
+    }
+    return out
+  }
+
+  // Ranks one source on its own and keeps the head, so a cap selects the best
+  // rows of that section rather than whichever ones the catalogue listed first.
+  function idleSlice(list, limit) {
+    return root.globallyRank(list, "").slice(0, limit)
+  }
+
+  function idleRows() {
+    var fallback = root.appRows("", false)
+    var learned = root.settings.learningEnabled && root.usage && root.usage.items
+      && Object.keys(root.usage.items).length > 0
+    var apps = learned ? root.idleSlice(root.appRows("", true), root.idleAppRows) : []
+    // Top up from the catalogue until the section is full, so a fresh install
+    // still opens on a usable list rather than an empty one.
+    for (var i = 0; i < fallback.length && apps.length < root.idleAppRows; i++) {
+      if (!learned || !Frecency.hasItem(root.usage, fallback[i].stableId)) apps.push(fallback[i])
+    }
+    if (!learned) return apps
+    return apps
+      .concat(root.idleSlice(root.commandRows("", true, true), root.idleCommandRows))
+      .concat(root.idleSlice(root.learnedFileRows(), root.idleFileRows))
+      .concat(root.idleSlice(root.windowRows("", true), root.idleWindowRows))
+  }
+
   function suggestionResultRows(q) {
     if (root.suggestionRows.length === 0) return []
+    var needle = Query.parse(q).text
     var engine = String(root.settings.searchEngine || "g")
     var out = []
     for (var i = 0; i < root.suggestionRows.length; i++) {
       var s = root.suggestionRows[i]
       out.push(root.row({
         key: "sugg:" + s,
-        section: "Web Suggestions", kind: "url",
+        kind: "url",
         title: s, subtitle: "",
-        accessory: Web.engineName(engine),
+        accessory: "Web",
         icon: Web.engineIcon(engine),
         primaryLabel: "Search " + Web.engineName(engine),
+        matchText: needle,
+        resultType: "web",
         payload: { url: Web.searchUrl(s, engine) }
       }))
     }
@@ -841,41 +1619,146 @@ Item {
     if (Web.detectUrl(q)) return []
     var engine = String(root.settings.searchEngine || "g")
     return [root.row({
-      key: "web.fallback", section: "Search the Web", kind: "url",
+      key: "web.fallback", kind: "url",
       title: "Search " + Web.engineName(engine) + " for “" + q + "”",
       subtitle: "",
-      accessory: Web.engineName(engine),
+      accessory: "Web",
       icon: Web.engineIcon(engine),
       primaryLabel: "Search " + Web.engineName(engine),
+      resultType: "web",
+      textMatch: Fuzzy.MATCH_RESIDUAL,
       payload: { url: Web.searchUrl(q, engine) }
     })]
   }
 
+  function filterHintRow(parsed) {
+    return root.row({
+      key: "filter.hint", kind: "noop",
+      title: "Type a search after “" + parsed.raw + "”",
+      subtitle: "This filter searches " + parsed.filter + " results only",
+      accessory: "Hint", icon: "󰋼", primaryLabel: "",
+      textMatch: Fuzzy.MATCH_EXACT
+    })
+  }
+
+  function viewCompletionRows(q) {
+    var views = Query.viewCompletions(q)
+    var out = []
+    for (var i = 0; i < views.length; i++) {
+      var name = views[i]
+      var details = Query.viewDetails(name)
+      out.push(root.row({ key: "view:" + name, kind: "view",
+        title: name + ":", subtitle: details.title,
+        section: "Views", accessory: "View", icon: details.icon,
+        primaryLabel: "Open view", textMatch: Fuzzy.MATCH_EXACT, tieRank: i,
+        resultType: "view", payload: { query: name + ":" } }))
+    }
+    return out
+  }
+
+  function completeView(row) {
+    input.text = String(row.payload.query)
+    input.cursorPosition = input.text.length
+  }
+
+  function globallyRank(list, q) {
+    var now = Date.now()
+    var context = Query.contextKey(Query.parse(root.query))
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i]
+      if (row.textMatch < 0) {
+        var matched = Fuzzy.score(row, row.matchText || q)
+        row.textMatch = matched >= 0 ? matched : Fuzzy.MATCH_RESIDUAL
+      }
+      var bonus = Frecency.bonuses(root.usage, row.stableId, context, now,
+        root.settings.learningEnabled)
+      row.recencyBonus = bonus.recency
+      row.frequencyBonus = bonus.frequency
+      row.contextBonus = bonus.context
+    }
+    var limit = Util.clamp(root.settings.maxResults, 8, root.maxGlobalResults)
+    return Ranking.rank(list, limit)
+  }
+
+  function resultSection(row) {
+    if (!row || row.key === "filter.hint") return ""
+    if (row.section) return row.section
+    if (row.resultType === "app") return "Applications"
+    if (row.resultType === "window") return "Windows"
+    if (row.resultType === "action") return "Commands"
+    if (row.resultType === "file") return "Files"
+    if (row.resultType === "clipboard") return "Clipboard"
+    if (row.resultType === "web") return "Web"
+    if (row.kind === "event") return "Calendar"
+    if (row.key.indexOf("reminder.") === 0) return "Reminders"
+    if (row.key === "calc") return "Calculator"
+    if (row.key === "unit") return "Conversions"
+    if (row.kind === "url") return "Direct links"
+    return "Results"
+  }
+
   // ------------------------------------------------------------- assembly
   function rebuild() {
+    if (!root.opened) return
     var q = String(root.query || "").trim()
+    var parsed = Query.parse(q)
 
     var next = []
     function push(list) { for (var i = 0; i < list.length; i++) next.push(list[i]) }
 
-    var fileTarget = root.settings.fileSearch ? root.fileSearchTarget(q) : null
-    if (fileTarget && fileTarget.explicit) {
-      // A file keyword is an explicit provider choice, just like the clipboard
-      // prefix. Keep unrelated matches from burying the result it requested.
-      push(root.fileResultRows(q))
+    var view = Query.isView(parsed.filter)
+    if (parsed.filter === "ai") {
+      next.push(root.row({
+        key: "ai.ask", kind: !root.settings.aiEnabled ? "spotlight-settings" : parsed.empty ? "noop" : "ai",
+        title: root.settings.aiEnabled
+          ? (parsed.empty ? "Ask AI…" : "Ask " + (root.settings.aiProvider === "codex" ? "Codex" : "Claude"))
+          : "Enable AI in Spotlight Settings",
+        subtitle: root.settings.aiEnabled ? parsed.text : "",
+        accessory: "AI", icon: "󰚩", primaryLabel: root.settings.aiEnabled ? "Ask AI" : "Open settings"
+      }))
+    } else if (view) {
+      push(root.viewResultRows(parsed.filter, parsed.text))
+    } else if (parsed.filter === "window") {
+      // Like a view: `w:` lists every window and typing narrows it down.
+      push(root.windowRows(parsed.text))
+    } else if (parsed.empty) {
+      next.push(root.filterHintRow(parsed))
+    } else if (parsed.filter) {
+      var searchable = parsed.text.length >= 2
+      if (parsed.filter === "app" && searchable) push(root.appRows(parsed.text))
+      else if (parsed.filter === "file") push(root.fileResultRows(q))
+      else if (parsed.filter === "action" && searchable) push(root.commandRows(parsed.text, true))
+      else if (parsed.filter === "clipboard") push(root.clipboardResultRows(q))
+      else if (parsed.filter === "tldr") push(root.tldrResultRows())
+      else if (parsed.filter === "web") {
+        push(root.intentRows(parsed.text, "web"))
+        push(root.bangRows(parsed.text))
+        push(root.suggestionResultRows(q))
+        push(root.webFallbackRows(parsed.text))
+      } else if (parsed.filter === "calc" || parsed.filter === "unit"
+          || parsed.filter === "reminder" || parsed.filter === "calendar") {
+        push(root.intentRows(parsed.text, parsed.filter))
+      }
+    } else if (!q) {
+      push(root.idleRows())
     } else {
-      push(root.intentRows(q))
-      push(root.clipboardResultRows(q))
+      push(root.viewCompletionRows(q))
+      push(root.intentRows(q, ""))
       push(root.reminderListRows(q))
       push(root.appRows(q))
-      push(root.windowRows(q))
+      if (q.length >= 2) {
+        push(root.windowRows(q))
+        push(root.commandRows(q, false))
+        push(root.fileResultRows(q))
+        push(root.clipboardResultRows(q))
+      }
       push(root.bangRows(q))
-      push(root.commandRows(q))
-      push(root.fileResultRows(q))
       push(root.suggestionResultRows(q))
       push(root.webFallbackRows(q))
     }
 
+    // A view's rows arrive ranked and bounded by lib/Views.js.
+    if (!view) next = root.globallyRank(next, parsed.text)
     root.rows = next
 
     displayModel.clear()
@@ -883,13 +1766,14 @@ Item {
       var r = next[j]
       displayModel.append({
         rowIndex: j,
-        section: r.section,
         rowTitle: r.title,
         rowSubtitle: r.subtitle,
         rowAccessory: r.accessory,
         rowIcon: r.icon,
         rowImage: r.image,
         rowMono: r.mono,
+        rowSection: root.resultSection(r),
+        rowState: (r.payload && r.payload.stateId) ? r.payload.stateId : "",
         selectable: r.kind !== "noop"
       })
     }
@@ -903,6 +1787,7 @@ Item {
     if (root.pinnedKey && restored < 0) root.pinnedKey = ""
     root.selectedIndex = restored >= 0 ? restored : root.firstSelectableIndex()
     root.cursorActive = next.length > 0
+    root.schedulePreview()
     pointerGate.reset()
     Qt.callLater(function() {
       if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
@@ -920,8 +1805,7 @@ Item {
   }
 
   function firstSelectableIndex() {
-    for (var i = 0; i < root.rows.length; i++) if (root.rows[i].kind !== "noop") return i
-    return 0
+    return Query.firstSelectableIndex(root.rows, root.query)
   }
 
   function selectedRow() {
@@ -983,6 +1867,53 @@ Item {
     Util.execArgv(["omarchy-launch-browser", String(url)])
   }
 
+  // Spotify Jam links (spotify.link short links or open.spotify.com
+  // /socialsession/ URLs) resolve to an internal spotify:socialsession URI
+  // through the helper's spotify-jam subcommand — no network in QML. The URI
+  // goes straight to the desktop client: xdg-open gets intercepted by the
+  // browser's scheme-handler prompt instead of reaching it.
+  function openSpotifyJam(url) {
+    jamProc.running = false
+    jamProc.command = root.helperArgv(["spotify-jam", String(url)])
+    jamProc.running = true
+  }
+
+  property alias jamProc: jamProcess
+
+  Process {
+    id: jamProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var uri = ""
+        try {
+          var parsed = JSON.parse(text)
+          if (parsed.ok && typeof parsed.uri === "string") uri = parsed.uri
+        } catch (e) { uri = "" }
+        if (uri) Util.execArgv(["uwsm-app", "--", "spotify", "--uri=" + uri])
+        else console.warn("spotlight: spotify-jam could not resolve the link")
+      }
+    }
+  }
+
+  // With holdIf, the terminal stays open only after that exit status.
+  function openHeldTerminal(argv, holdIf) {
+    var hold = holdIf === undefined ? [] : ["--hold-if", String(holdIf)]
+    Util.execArgv(["omarchy-launch-terminal", "bash",
+      root.pluginFolder + "/bin/spotlight-hold.bash"].concat(hold, argv))
+  }
+
+  // Runs the step lib/Views.js chose for a view row; null leaves the panel open.
+  function runViewAction(step) {
+    if (!step) return
+    root.dismiss()
+    if (step.copy !== undefined) Util.execArgv(["wl-copy", "--", step.copy])
+    else if (step.url) root.openUrl(step.url)
+    else if (step.path) root.openPath(step.path)
+    else if (step.terminal) root.openHeldTerminal(step.terminal, step.holdIf)
+    else if (step.argv) Util.execArgv(step.argv)
+  }
+
   function openPath(path) {
     var target = String(path || "")
     if (!target) {
@@ -1002,30 +1933,89 @@ Item {
   // With no deliberate cursor the intent is always "the best row for what I
   // typed", and resolving that at the keystroke closes the window between a
   // rebuild landing and the cursor settling onto it.
+  // The path a Ctrl+C would copy, or "" when the selected row has none. A
+  // folder copies as its own path, not its parent's.
+  function copyPathTarget() {
+    var r = root.selectedRow()
+    return (r && r.resultType === "file" && r.payload && r.payload.path)
+      ? String(r.payload.path) : ""
+  }
+
+  function copySelectedPath() {
+    var path = root.copyPathTarget()
+    if (path === "") return
+    root.dismiss()
+    // wl-copy over argv, never a shell string: the path is user data.
+    Util.execArgv(["wl-copy", "--", path])
+  }
+
+  // The row Enter and Tab act on: the deliberate cursor, else the best row.
+  function targetIndex() {
+    return root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex()
+  }
+
   function activateSelection(secondary) {
-    root.activate(root.pinnedKey ? root.selectedIndex : root.firstSelectableIndex(), secondary)
+    root.activate(root.targetIndex(), secondary)
+  }
+
+  // The switch moves immediately and the probe confirms it after the detached
+  // command has had time to finish.
+  function flipToggle(r) {
+    var id = r.payload.stateId
+    var on = root.toggleStates[id] === true
+    var argv = r.payload.argv
+    if (!Array.isArray(argv) || argv.length === 0) return
+    Util.execArgv(argv)
+    var next = ({})
+    for (var k in root.toggleStates) next[k] = root.toggleStates[k]
+    next[id] = !on
+    root.toggleStates = next
+    toggleReconcile.restart()
   }
 
   function activate(index, secondary) {
     var r = root.rows[index]
     if (!r || r.kind === "noop") return
+    if (r.kind === "currency-wait") {
+      if (!secondary && root.currencySession.target)
+        root.pendingCurrency = { query: root.query, key: root.currencySession.target.key }
+      return
+    }
 
-    // One confirmation for the rows that end the session.
-    if (r.confirm && !secondary && root.armedKey !== r.key) {
+    // Rows marked confirm take a second Enter. None of them has a secondary
+    // action, so Shift+Enter has to confirm as well.
+    if (r.confirm && root.armedKey !== r.key) {
       root.armedKey = r.key
       return
     }
     root.armedKey = ""
+    if (!secondary) root.bumpUsage(r)
+
+    if (Query.isView(r.kind)) {
+      root.runViewAction(Views.action(r.kind, r.payload, secondary))
+      return
+    }
 
     switch (r.kind) {
+    case "ai":
+      root.startAi()
+      break
+    case "view":
+      root.completeView(r)
+      break
+
     case "app":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.launchApp(r.payload.appId, r.payload.name)
       break
 
     case "shell":
-      root.bumpUsage(r.key)
+      // A toggle row keeps the panel open: its switch is the only feedback the
+      // press produces, and closing over it would hide exactly that.
+      if (r.payload.stateId && root.toggleStates[r.payload.stateId] !== undefined) {
+        root.flipToggle(r)
+        break
+      }
       root.dismiss()
       // execArgv, not execDetached: the catalogue holds argv vectors rather
       // than command lines, so nothing here is ever re-tokenized by a shell.
@@ -1034,22 +2024,31 @@ Item {
       break
 
     case "url":
-      root.bumpUsage(r.key)
       root.dismiss()
       root.openUrl(r.payload.url)
       break
 
-    case "summon":
-      root.bumpUsage(r.key)
+    case "spotifyjam":
       root.dismiss()
-      if (root.shell && typeof root.shell.summon === "function")
-        root.shell.summon(r.payload.id, "{}")
+      root.openSpotifyJam(r.payload.url)
+      break
+
+    case "summon":
+      root.dismiss()
+      pluginSummonProc.running = false
+      pluginSummonProc.command = root.helperArgv(["summon-plugin", r.payload.id])
+      pluginSummonProc.running = true
       break
 
     case "copy":
       root.dismiss()
       // wl-copy over argv, never a shell string: the text is user data.
-      Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
+      // Shift+Enter, on rows that offer it, puts the text on a terminal prompt
+      // unexecuted: bash gets it as $1 and the rc file moves it onto readline.
+      if (secondary && r.secondaryLabel)
+        Util.execArgv(["omarchy-launch-terminal", "bash", "--rcfile",
+          root.pluginFolder + "/bin/spotlight-prefill.bash", "-s", "--", String(r.payload.text || "")])
+      else Util.execArgv(["wl-copy", "--", String(r.payload.text || "")])
       break
 
     case "clipcopy":
@@ -1092,6 +2091,27 @@ Item {
       if (secondary) root.openPath(r.payload.dir)
       else root.openPath(r.payload.path)
       break
+
+    case "spotlight-settings":
+      // The GUI is the settings surface; the file stays one keystroke away for
+      // whatever it does not cover.
+      if (secondary) root.editSettingsFile()
+      else root.showSettingsPanel()
+      break
+
+    case "spotlight-plugin":
+      root.dismiss()
+      root.openPath(root.pluginFolder)
+      break
+
+    case "spotlight-tour":
+      root.showTour(0, false)
+      break
+
+    case "spotlight-data":
+      root.dismiss()
+      root.openDataFolder()
+      break
     }
   }
 
@@ -1106,8 +2126,10 @@ Item {
   // is stepped over rather than written through, and it reports back the path
   // it actually used.
   function saveIcs(payload) {
-    var stamp = String(payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
+    var stamp = String(payload.stamp || payload.start).replace(/[^0-9TZ]/g, "").slice(0, 32)
     if (!stamp) return
+    // DTSTAMP is always an instant; only the event's own bounds go date-only.
+    var dateOnly = payload.allDay ? ";VALUE=DATE" : ""
     var ics = [
       "BEGIN:VCALENDAR",
       "VERSION:2.0",
@@ -1116,9 +2138,9 @@ Item {
       "METHOD:PUBLISH",
       "BEGIN:VEVENT",
       "UID:spotlight-" + stamp + "@omarchy",
-      "DTSTAMP:" + payload.start,
-      "DTSTART:" + payload.start,
-      "DTEND:" + payload.end,
+      "DTSTAMP:" + stamp,
+      "DTSTART" + dateOnly + ":" + payload.start,
+      "DTEND" + dateOnly + ":" + payload.end,
       "SUMMARY:" + String(payload.title).replace(/([,;\\])/g, "\\$1").slice(0, 400),
       "END:VEVENT",
       "END:VCALENDAR",
@@ -1136,6 +2158,7 @@ Item {
   // ------------------------------------------------------------- async data
   function loadSuggestions(raw, forQuery) {
     if (forQuery !== String(root.query || "").trim()) return
+    if (root.currencyQuery(Query.parse(forQuery).text)) return
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.suggestions)) ? reply.suggestions : []
     var limit = Util.clamp(root.settings.maxSuggestions, 0, 8)
@@ -1157,8 +2180,10 @@ Item {
 
   function fileSearchTarget(q) {
     var s = String(q || "").trim()
-    var m = s.match(/^(?:f|file|files)\s+(\S.*)$/i)
-    if (m) return { pattern: m[1].trim(), dir: root.home, explicit: true }
+    var parsed = Query.parse(s)
+    if (parsed.filter === "file")
+      return parsed.empty ? null : { pattern: parsed.text, dir: root.home, explicit: true }
+    if (parsed.filter) return null
     if (/^~\//.test(s) || /^\//.test(s)) {
       var slash = s.lastIndexOf("/")
       var dir = s.slice(0, slash + 1).replace(/^~/, root.home)
@@ -1170,7 +2195,7 @@ Item {
     // explicit (it does not scope the results to files only) nor treated like
     // one for the web-suggestions guard below (it did not ask for files, it
     // just also got them).
-    if (root.settings.fileSearchAlways && s.length >= 1) {
+    if (root.settings.fileSearchAlways && s.length >= 2) {
       return { pattern: s, dir: root.home, explicit: false, implicit: true }
     }
     return null
@@ -1186,6 +2211,7 @@ Item {
       var f = list[i]
       if (!f || !f.path) continue
       candidates.push({
+        id: String(f.id || ""),
         path: String(f.path),
         name: String(f.name || ""),
         dir: String(f.dir || "/"),
@@ -1220,7 +2246,8 @@ Item {
     if (root.opened) root.rebuild()
   }
 
-  function loadClipboard(raw) {
+  function loadClipboard(raw, forQuery) {
+    if (forQuery !== String(root.query || "").trim()) return
     var reply = root.helperReply(raw)
     var list = (reply && Array.isArray(reply.items)) ? reply.items : []
     var out = []
@@ -1230,29 +2257,233 @@ Item {
       out.push({ index: Util.clamp(item.index, 0, 1000), title: item.title })
     }
     root.clipboardRows = out
+    root.clipboardFor = forQuery
     if (root.opened) root.rebuild()
+  }
+
+  function loadTldr(raw, forQuery) {
+    if (forQuery !== String(root.query || "").trim()) return
+    root.tldrPage = root.helperReply(raw)
+    if (root.opened) root.rebuild()
+  }
+
+  function syncView(filter) {
+    var name = root.opened && Query.isView(filter) ? filter : ""
+    if (name !== root.viewName) root.resetView(name)
+  }
+
+  // Every view change goes through here. Each run carries its own view and
+  // generation, so a cancelled run that still finishes is ignored and the next
+  // run never waits for it.
+  function resetView(name) {
+    var proc = root.viewProcess
+    root.viewProcess = null
+    if (proc) proc.running = false
+    root.viewName = name
+    root.viewGeneration++
+    root.viewRows = []
+    root.viewPartial = false
+    root.viewState = name ? "loading" : "idle"
+    if (!name || !root.opened) return
+    proc = viewProcessComponent.createObject(root, {
+      forView: name, forGeneration: root.viewGeneration,
+      command: root.helperArgv([Query.viewDetails(name).command || name])
+    })
+    if (!proc) {
+      root.finishView("", name, root.viewGeneration)
+      return
+    }
+    root.viewProcess = proc
+    proc.running = true
+  }
+
+  function finishView(raw, name, generation) {
+    if (!root.opened || root.viewName !== name || root.viewGeneration !== generation) return
+    var field = Query.viewDetails(name).field
+    var reply = root.helperReply(raw)
+    if (!reply || !Array.isArray(reply[field])) {
+      root.viewRows = []
+      root.viewState = "error"
+    } else {
+      root.viewRows = reply[field].slice(0, root.maxViewEntries)
+      root.viewState = "ready"
+      root.viewPartial = reply.partial === true
+    }
+    root.rebuild()
+  }
+
+  // ------------------------------------------------------------- preview
+  // Reserve the pane while results arrive; rows without a rich preview show
+  // their name and description without changing the column layout.
+  property var preview: null
+  // { key, state, reply } for the selected row's helper call. Only the one
+  // selected row's data is held — a clipboard entry in particular is dropped
+  // as soon as the cursor leaves it.
+  property var previewData: null
+  property bool previewQueued: false
+  property var previewProcess: null
+  readonly property bool previewShown: panel.visible && root.settings.previewPane !== false
+    && !root.aiActive && panel.width >= Style.space(960)
+
+  function schedulePreview() {
+    if (root.previewQueued) return
+    root.previewQueued = true
+    Qt.callLater(function() {
+      root.previewQueued = false
+      root.updatePreview()
+    })
+  }
+
+  function previewContext() {
+    return { defaultCurrency: root.settings.defaultCurrency,
+             currencyRates: root.settings.currencyRates !== false,
+             formatNumber: Units.formatNumber }
+  }
+
+  // Window rows carry the Wayland handle; where it sits comes from Hyprland
+  // when the pane asks, not on every keystroke that ranks windows.
+  function windowPreviewRow(r) {
+    var t = r.payload ? r.payload.toplevel : null
+    var extra = { toplevel: t, appId: r.subtitle }
+    try {
+      var values = Hyprland.toplevels.values || []
+      for (var i = 0; i < values.length; i++) {
+        if (values[i].wayland !== t) continue
+        var ipc = values[i].lastIpcObject || {}
+        var ws = values[i].workspace
+        extra.workspace = ws ? String(ws.name || ws.id || "") : ""
+        extra.monitor = ws && ws.monitor ? String(ws.monitor.name || "") : ""
+        var flags = []
+        if (ipc.floating) flags.push("Floating")
+        if (ipc.fullscreen) flags.push("Fullscreen")
+        if (ipc.pinned) flags.push("Pinned")
+        if (ipc.size && ipc.size.length === 2) flags.push(ipc.size[0] + " × " + ipc.size[1])
+        extra.state = flags.join(" · ")
+        break
+      }
+    } catch (e) {
+    }
+    var copy = {}
+    for (var k in r) copy[k] = r[k]
+    copy.payload = extra
+    return copy
+  }
+
+  function updatePreview() {
+    if (!root.opened) return
+    if (!root.previewShown) {
+      root.preview = null
+      root.previewData = null
+      previewDebounce.stop()
+      return
+    }
+    var r = root.cursorActive ? root.selectedRow() : null
+    if (r && r.kind === "window") r = root.windowPreviewRow(r)
+    var ctx = root.previewContext()
+    var need = r ? Preview.need(r, ctx) : null
+    if (!need) {
+      root.previewData = null
+      previewDebounce.stop()
+    } else if (!root.previewData || root.previewData.key !== need.key) {
+      root.previewData = { key: need.key, state: "loading", reply: null }
+      previewDebounce.args = need.args
+      previewDebounce.key = need.key
+      previewDebounce.restart()
+    }
+    root.preview = r ? Preview.build(r, ctx, root.previewData) : null
+  }
+
+  function stopPreviewProcess() {
+    var proc = root.previewProcess
+    root.previewProcess = null
+    if (proc) proc.running = false
+  }
+
+  // A run that was cancelled may still answer; its reply counts only if it is
+  // a whole one, never as a failure for the run that replaced it.
+  function loadPreview(raw, key, current) {
+    if (!root.previewData || root.previewData.key !== key) return
+    var reply = root.helperReply(raw)
+    if (!reply && !current) return
+    root.previewData = { key: key, state: reply ? "ready" : "error", reply: reply }
+    root.updatePreview()
+  }
+
+  onPreviewShownChanged: root.schedulePreview()
+
+  function stopCurrencyProcess() {
+    var proc = root.currencyProcess
+    root.currencyProcess = null
+    if (proc) proc.running = false
+  }
+
+  function updateCurrency() {
+    var parsed = Query.parse(root.query)
+    var target = root.opened && (!parsed.filter || parsed.filter === "unit")
+      && !Units.convert(parsed.text) ? root.currencyQuery(parsed.text) : null
+    var generation = root.currencySession.generation
+    var lookup = Currency.select(root.currencySession, target, Date.now())
+    if (generation !== root.currencySession.generation) root.stopCurrencyProcess()
+    currencyDebounce.stop()
+    if (lookup) currencyDebounce.restart()
+  }
+
+  function loadCurrency(raw, request) {
+    if (!root.opened) return
+    if (!Currency.accept(root.currencySession, request, root.helperReply(raw), Date.now())) return
+    if (Currency.select(root.currencySession, root.currencySession.target, Date.now()))
+      currencyDebounce.restart()
+    root.rebuild()
+    var pending = root.pendingCurrency
+    if (!pending || pending.query !== root.query || !root.currencySession.target
+        || pending.key !== root.currencySession.target.key) return
+    var index = root.indexOfKey("currency")
+    if (index >= 0 && root.rows[index].kind === "copy") {
+      root.pendingCurrency = null
+      root.activate(index, false)
+    } else if (!currencyDebounce.running) root.pendingCurrency = null
   }
 
   // Query changes fan out to the async providers on a short debounce so a
   // fast typist does not spawn a process per keystroke.
   onQueryChanged: {
+    root.resetFolders()
+    if (root.query !== root.aiQuery) root.aiActive = false
     root.armedKey = ""
+    root.pendingCurrency = null
     // A new query invalidates a deliberate cursor: the row it named may not
     // even be in the list any more.
     root.pinnedKey = ""
     typingGuard.restart()
 
     var q = String(root.query || "").trim()
+    // Clearing the search dismisses the saved answer as well as the panel.
+    if (!q && root.aiQuery !== "") root.stopAi()
+    var parsed = Query.parse(q)
+    root.updateCurrency()
+
+    root.syncView(parsed.filter)
 
     // The clipboard list is fetched while a clipboard query is on screen and
     // dropped the moment it is not, so the titles are resident for the length
     // of the query rather than the length of the session.
-    if (root.clipboardQuery(q)) {
+    var clipboardTarget = root.clipboardSearchTarget(q)
+    if (clipboardTarget) {
+      clipboardDebounce.forQuery = q
       clipboardDebounce.restart()
     } else {
       clipboardDebounce.stop()
       if (root.clipboardRows.length > 0) root.clipboardRows = []
+      root.clipboardFor = ""
     }
+
+    // Any query change drops the page; loadTldr only stores a reply for the current query.
+    root.tldrPage = null
+    if (parsed.filter === "tldr" && parsed.text) {
+      tldrDebounce.forQuery = q
+      tldrDebounce.text = parsed.text
+      tldrDebounce.restart()
+    } else tldrDebounce.stop()
 
     var target = root.settings.fileSearch ? root.fileSearchTarget(q) : null
     if (target && target.pattern.length >= 1) {
@@ -1268,13 +2499,17 @@ Item {
     // A fileSearchAlways match is passive — the query never asked for files,
     // it just also got them — so unlike an explicit "f " prefix or a typed
     // path, it must not be the thing that silences web suggestions too.
+    var suggestionText = parsed.filter === "web" ? parsed.text : q
     var fileSuggestGuard = root.fileSearchTarget(q)
-    var wantSuggestions = root.settings.webSuggestions && q.length >= 2
-      && !Web.detectUrl(q) && !Web.bang(q) && !Calc.evaluate(q)
-      && !NaturalTime.isReminderQuery(q) && !NaturalTime.isEventQuery(q)
-      && !root.clipboardQuery(q) && !(fileSuggestGuard && !fileSuggestGuard.implicit)
+    var wantSuggestions = root.settings.webSuggestions && suggestionText.length >= 2
+      && (!parsed.filter || parsed.filter === "web")
+      && !Web.detectUrl(suggestionText) && !Web.bang(suggestionText) && !Calc.evaluate(suggestionText)
+      && !root.currencyQuery(suggestionText)
+      && !NaturalTime.isReminderQuery(suggestionText) && !NaturalTime.isEventQuery(suggestionText)
+      && !(fileSuggestGuard && !fileSuggestGuard.implicit)
     if (wantSuggestions) {
       suggestDebounce.forQuery = q
+      suggestDebounce.pattern = suggestionText
       suggestDebounce.restart()
       // Suggestions go stale the moment the query stops being a continuation
       // of the one that fetched them. Keeping the ones the new query still
@@ -1295,8 +2530,8 @@ Item {
   }
 
   // A keystroke owns the cursor for a moment afterwards: long enough to cover
-  // the card's height animation and the hover events it generates as rows
-  // slide under a stationary pointer, short enough that reaching for the mouse
+  // async results and the hover events they generate under a stationary
+  // pointer, short enough that reaching for the mouse
   // straight after typing still works.
   Timer {
     id: typingGuard
@@ -1304,20 +2539,117 @@ Item {
   }
 
   Timer {
+    id: currencyDebounce
+    interval: 250
+    onTriggered: {
+      if (!root.opened) return
+      var request = Currency.begin(root.currencySession)
+      if (!request) return
+      var proc = currencyProcessComponent.createObject(root, {
+        request: request, cachedOnly: !root.settings.currencyRates
+      })
+      if (!proc) {
+        root.loadCurrency("", request)
+        return
+      }
+      root.currencyProcess = proc
+      proc.running = true
+    }
+  }
+
+  // Each run owns an immutable request token. A cancelled process can finish
+  // collecting stdout after a replacement starts without adopting its token.
+  Component {
+    id: currencyProcessComponent
+    Process {
+      id: currencyRun
+      required property var request
+      required property bool cachedOnly
+      property bool delivered: false
+      command: root.helperArgv(cachedOnly
+        ? ["currency-rate", "--cached-only", request.base, request.quote]
+        : ["currency-rate", request.base, request.quote])
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          currencyRun.delivered = true
+          root.loadCurrency(text, currencyRun.request)
+        }
+      }
+      onExited: {
+        Qt.callLater(function() {
+          if (!currencyRun.delivered) root.loadCurrency("", currencyRun.request)
+          if (root.currencyProcess === currencyRun) root.currencyProcess = null
+          currencyRun.destroy()
+        })
+      }
+    }
+  }
+
+  // Arrowing through a list should not start a helper per row passed over.
+  Timer {
+    id: previewDebounce
+    interval: 120
+    property var args: []
+    property string key: ""
+    onTriggered: {
+      root.stopPreviewProcess()
+      if (!root.opened) return
+      var proc = previewProcessComponent.createObject(root, {
+        key: previewDebounce.key, args: previewDebounce.args
+      })
+      if (!proc) {
+        root.loadPreview("", previewDebounce.key, true)
+        return
+      }
+      root.previewProcess = proc
+      proc.running = true
+    }
+  }
+
+  // Each run carries its own key, so a cancelled run that still finishes
+  // collecting stdout cannot land on the row selected after it.
+  Component {
+    id: previewProcessComponent
+    Process {
+      id: previewRun
+      required property string key
+      required property var args
+      property bool delivered: false
+      command: root.helperArgv(args)
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          previewRun.delivered = true
+          root.loadPreview(text, previewRun.key, root.previewProcess === previewRun)
+        }
+      }
+      onExited: {
+        Qt.callLater(function() {
+          if (!previewRun.delivered) root.loadPreview("", previewRun.key, root.previewProcess === previewRun)
+          if (root.previewProcess === previewRun) root.previewProcess = null
+          previewRun.destroy()
+        })
+      }
+    }
+  }
+
+  Timer {
     id: suggestDebounce
     interval: 220
     property string forQuery: ""
+    property string pattern: ""
     onTriggered: {
       suggestProc.running = false
       suggestProc.forQuery = suggestDebounce.forQuery
-      suggestProc.command = root.helperArgv(["suggest", suggestDebounce.forQuery])
+      suggestProc.command = root.helperArgv(["suggest", suggestDebounce.pattern, root.settings.searchEngine || "g"])
       suggestProc.running = true
     }
   }
 
-  // The helper builds the endpoint itself and runs curl under a byte ceiling
-  // and its own deadline, so neither a slow endpoint nor an oversized response
-  // can hold or fill the shell process.
+  // The helper builds the endpoint itself and reads it under a byte ceiling
+  // and timeout, so neither a slow endpoint nor an oversized response can fill
+  // the shell process.
   Process {
     id: suggestProc
     property string forQuery: ""
@@ -1357,8 +2689,10 @@ Item {
   Timer {
     id: clipboardDebounce
     interval: 160
+    property string forQuery: ""
     onTriggered: {
       clipboardProc.running = false
+      clipboardProc.forQuery = clipboardDebounce.forQuery
       clipboardProc.command = root.helperArgv(["read-clipboard"])
       clipboardProc.running = true
     }
@@ -1366,9 +2700,82 @@ Item {
 
   Process {
     id: clipboardProc
+    property string forQuery: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.loadClipboard(text)
+      onStreamFinished: root.loadClipboard(text, clipboardProc.forQuery)
+    }
+  }
+
+  Timer {
+    id: tldrDebounce
+    interval: 160
+    property string text: ""
+    property string forQuery: ""
+    onTriggered: {
+      tldrProc.running = false
+      tldrProc.forQuery = tldrDebounce.forQuery
+      tldrProc.command = root.helperArgv(["tldr", tldrDebounce.text])
+      tldrProc.running = true
+    }
+  }
+
+  Process {
+    id: tldrProc
+    property string forQuery: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadTldr(text, tldrProc.forQuery)
+    }
+  }
+
+  // One process per view run, the same shape as the currency lookup: a
+  // cancelled run may still finish collecting stdout, and its own token keeps
+  // that from landing on a newer view.
+  Component {
+    id: viewProcessComponent
+    Process {
+      id: viewRun
+      required property string forView
+      required property int forGeneration
+      property bool delivered: false
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          viewRun.delivered = true
+          root.finishView(text, viewRun.forView, viewRun.forGeneration)
+        }
+      }
+      // ponytail: nothing retries a run that never starts or never exits; its
+      // view stays on "Loading…" until the filter changes. Every helper call
+      // needs python3, so a missing interpreter is not handled here alone.
+      onExited: {
+        Qt.callLater(function() {
+          if (!viewRun.delivered) root.finishView("", viewRun.forView, viewRun.forGeneration)
+          if (root.viewProcess === viewRun) root.viewProcess = null
+          viewRun.destroy()
+        })
+      }
+    }
+  }
+
+  Component {
+    id: aiProcessComponent
+    Process {
+      id: aiRun
+      required property int generation
+      property bool delivered: false
+      stdout: SplitParser {
+        onRead: function(line) {
+          if (root.handleAiLine(line, aiRun.generation)) aiRun.delivered = true
+        }
+      }
+      onExited: Qt.callLater(function() {
+        if (!aiRun.delivered && root.aiBusy && aiRun.generation === root.aiGeneration)
+          root.failAi("AI stopped before returning an answer")
+        if (root.aiProcess === aiRun) root.aiProcess = null
+        aiRun.destroy()
+      })
     }
   }
 
@@ -1383,10 +2790,30 @@ Item {
   }
 
   Process {
+    id: toggleStatesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadToggleStates(text)
+    }
+  }
+
+  // One late confirmation pass, not a poll. Night Light's cold start retries
+  // for up to two seconds, so probing earlier can capture an intermediate state.
+  Timer {
+    id: toggleReconcile
+    interval: 2500
+    onTriggered: root.refreshToggleStates()
+  }
+
+  Process {
     id: settingsProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.loadSettings(text)
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (reply && reply.aiModels) root.aiModels = reply.aiModels
+        if (!root.settingsReadStale) root.loadSettings(text)
+      }
     }
   }
 
@@ -1403,6 +2830,26 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.loadMenuCommands(text)
+    }
+  }
+
+  Process {
+    id: pluginsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadPluginCommands(text)
+    }
+  }
+
+  Process {
+    id: pluginSummonProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (!root.helperReply(text))
+          Util.execArgv(["notify-send", "Spotlight could not open plugin",
+            root.helperError(text) || "The shell did not confirm the launch."])
+      }
     }
   }
 
@@ -1439,6 +2886,79 @@ Item {
     }
   }
 
+  Process {
+    id: maintenanceProc
+    property string action: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (!reply) return
+        if (maintenanceProc.action === "settings" && reply.path)
+          Util.execArgv(["omarchy", "launch", "editor", String(reply.path)])
+        else if (maintenanceProc.action === "data" && reply.path)
+          root.openPath(reply.path)
+        else if (maintenanceProc.action === "reset" && reply.reset === true) {
+          root.usage = Frecency.emptyStore()
+          settingsPanel.resetDone = true
+        }
+      }
+    }
+  }
+
+  // Separate from maintenanceProc: a failed write must surface as an error
+  // state instead of being swallowed, and a settings write must never cancel
+  // an in-flight binding write.
+  Process {
+    id: bindingProc
+    property string action: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var reply = root.helperReply(text)
+        if (bindingProc.action === "read") {
+          root.loadBinding(reply)
+        } else if (!reply) {
+          root.bindingState = "error"
+        } else {
+          bindingReloadProc.action = bindingProc.action
+          bindingReloadProc.command = ["hyprctl", "reload"]
+          bindingReloadProc.running = true
+        }
+      }
+    }
+  }
+
+  Process {
+    id: bindingReloadProc
+    property string action: ""
+    onExited: function(exitCode) {
+      root.bindingState = exitCode === 0
+        ? (bindingReloadProc.action === "write" ? "ok" : "reverted")
+        : "reloadError"
+      root.readBinding()
+    }
+  }
+
+  // Coalesce nearby edits; closing the panel flushes immediately.
+  Timer {
+    id: settingsWriteDebounce
+    interval: 300
+    onTriggered: root.flushSettings()
+  }
+
+  Process {
+    id: settingsWriteProc
+    // A helper that never started sends no reply, so nothing else settles it.
+    onRunningChanged: if (!running && Object.keys(root.settingsWrites.active).length) {
+      root.completeSettingsWrite("")
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.completeSettingsWrite(text)
+    }
+  }
+
   Component.onCompleted: {
     if (root.appLibrary) root.appLibrary.refreshIcons()
     root.refreshSettings()
@@ -1449,15 +2969,23 @@ Item {
   // its own deadline as a backstop, but the processes are terminated here so
   // teardown does not depend on one.
   Component.onDestruction: {
+    root.stopAi()
     root.stopQueryWork()
     clipCopyProc.running = false
     remindersProc.running = false
     settingsProc.running = false
     hidesProc.running = false
     menuCommandsProc.running = false
+    pluginsProc.running = false
+    pluginSummonProc.running = false
     usageReadProc.running = false
     usageWriteProc.running = false
     icsProc.running = false
+    maintenanceProc.running = false
+    bindingProc.running = false
+    bindingReloadProc.running = false
+    settingsWriteDebounce.stop()
+    settingsWriteProc.running = false
   }
 
   Connections {
@@ -1478,23 +3006,31 @@ Item {
   // ------------------------------------------------------------- surface
   PanelWindow {
     id: panel
-    visible: root.opened
+    visible: root.opened || root.presentationProgress > 0
+    property bool focusPrimed: false
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     // The Hyprland layer rule that frosts this surface matches on this
     // namespace. Renaming it silently turns the glass off.
     WlrLayershell.namespace: "omarchy-spotlight"
     WlrLayershell.layer: WlrLayer.Overlay
-    // Exclusive grabs the compositor's own keyboard input wholesale, so a
-    // bind like SUPER+arrow to move focus between windows goes dead while
-    // this is open and the overlay never yields. OnDemand still gets typing
-    // and Hyprland still focuses it the moment it maps (this window is only
-    // ever mapped fresh - `visible` follows `opened` directly, never staying
-    // mapped through a fade-out - which is the case Hyprland does grant
-    // OnDemand focus for), so nothing here needs the Exclusive-then-OnDemand
-    // prime a surface that stays mapped across a close would.
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
+    // Match the shell's KeyboardPanel: reacquire focus even during a fade-out,
+    // then yield compositor shortcuts. Closing releases input immediately.
+    WlrLayershell.keyboardFocus: !root.opened ? WlrKeyboardFocus.None
+      : panel.focusPrimed ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
+    mask: Region { width: root.opened ? panel.width : 0; height: root.opened ? panel.height : 0 }
+    contentItem.enabled: root.opened
+
+    Connections {
+      target: root
+      function onOpenedChanged() { panel.focusPrimed = false }
+    }
+    Timer {
+      interval: 75
+      running: root.opened && panel.backingWindowVisible && !panel.focusPrimed
+      onTriggered: panel.focusPrimed = true
+    }
 
     // Anything that moves focus elsewhere - the compositor's own focus
     // bind, alt-tab, a click on another output - must dismiss the launcher,
@@ -1523,9 +3059,10 @@ Item {
     //   switch, windows or not, so it is the third watcher, for exactly the
     //   case the other two both miss.
     HyprlandFocusGrab {
-      active: root.opened
+      // A previous grab can report cleared while the same surface reacquires focus.
+      active: root.opened && panel.focusPrimed
       windows: [panel]
-      onCleared: if (root.opened) root.dismiss()
+      onCleared: if (root.opened && panel.focusPrimed) root.dismiss()
     }
 
     Connections {
@@ -1541,12 +3078,12 @@ Item {
     Rectangle {
       anchors.fill: parent
       color: root.scrim
+      opacity: root.presentationProgress
     }
 
     // A screen-fixed frame for the pointer gate to measure against. The card
-    // is the wrong reference: it animates its height and stays centred, so it
-    // slides under a stationary pointer on every rebuild and every row that
-    // maps into it reads as deliberate movement.
+    // is the wrong reference: it animates its height, so rows can slide under
+    // a stationary pointer during a rebuild.
     Item {
       id: pointerFrame
       anchors.fill: parent
@@ -1559,20 +3096,23 @@ Item {
 
     Rectangle {
       id: card
+      // Hidden items cannot hold focus, which is what keeps keystrokes away
+      // from the search input while the tour or the settings panel is up.
+      visible: !root.tourActive && !root.settingsActive
 
-      readonly property int listHeight: Math.min(root.maxListHeight, root.contentHeight)
-      readonly property bool hasResults: displayModel.count > 0
+      readonly property int availableBodyHeight: Math.max(0, panel.height - y - Style.space(24)
+        - root.cardBorderWidth * 2 - root.searchHeight - root.footerHeight - root.hairline * 2 - root.listPadding * 2)
+      readonly property int bodyHeight: Math.min(root.maxListHeight, availableBodyHeight)
 
-      width: Math.min(Style.space(750), panel.width - Style.space(48))
+      width: Math.min(Style.space(960), panel.width - Style.space(48))
       height: root.cardBorderWidth * 2 + root.searchHeight
-        + (hasResults ? root.hairline + root.listPadding * 2 + listHeight : 0)
+        + root.hairline + root.listPadding * 2 + bodyHeight
         + root.hairline + root.footerHeight
-      // Centred at whatever height it currently is, not just when full. The
-      // height Behavior below drives y with it, so the panel grows and
-      // shrinks symmetrically about the middle of the screen instead of
-      // sitting high whenever a query returns only a few rows.
-      anchors.horizontalCenter: parent.horizontalCenter
-      anchors.verticalCenter: parent.verticalCenter
+      // Keep the search field fixed while results grow and shrink below it.
+      x: Style.space(24) + Math.max(0, panel.width - width - Style.space(48))
+        * root.settings.horizontalPosition / 100
+      y: Style.space(24) + Math.max(0, panel.height - root.maxCardHeight - Style.space(48))
+        * root.settings.verticalPosition / 100
 
       radius: root.cardRadius
       color: root.glassBackground
@@ -1580,22 +3120,13 @@ Item {
       border.color: root.glassBorder
       antialiasing: true
 
-      Behavior on height {
-        NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
-      }
+      opacity: root.presentationProgress
+      scale: 0.98 + 0.02 * root.presentationProgress
+      transformOrigin: Item.Top
+
 
       // Swallow clicks so they don't reach the dismiss MouseArea behind.
       MouseArea { anchors.fill: parent; onClicked: {} }
-
-      // The 1px light line along the top edge is what makes a translucent
-      // panel read as glass rather than as a flat tint.
-      Rectangle {
-        anchors { top: parent.top; left: parent.left; right: parent.right }
-        anchors.margins: root.cardBorderWidth
-        height: root.hairline
-        color: root.glassSheen
-        radius: height
-      }
 
       // ------------------------------------------------------- search row
       Item {
@@ -1661,60 +3192,132 @@ Item {
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
             typingGuard.restart()
+            if (root.aiActive) {
+              if (event.key === Qt.Key_Escape) {
+                root.dismiss()
+                event.accepted = true
+                return
+              }
+              if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                if (event.key === Qt.Key_Tab) aiPanel.focusFirst()
+                event.accepted = true
+                return
+              }
+              if (event.key === Qt.Key_Down || event.key === Qt.Key_PageDown
+                  || event.key === Qt.Key_Up || event.key === Qt.Key_PageUp) {
+                aiPanel.scrollBy((event.key === Qt.Key_Down ? 1 : event.key === Qt.Key_Up ? -1
+                  : event.key === Qt.Key_PageDown ? 6 : -6) * root.rowHeight)
+                event.accepted = true
+                return
+              }
+            }
+            var down = event.key === Qt.Key_Down
+              || (event.key === Qt.Key_N && event.modifiers === Qt.ControlModifier)
+            var up = event.key === Qt.Key_Up
+              || (event.key === Qt.Key_P && event.modifiers === Qt.ControlModifier)
+            if (root.folderPath && (down || up
+                || event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp)) {
+              if (root.folderProcess) root.folderProcess.running = false
+              root.folderProcess = null
+              var step = down ? 1 : up ? -1
+                : event.key === Qt.Key_PageDown ? 8 : -8
+              root.folderIndex = Math.max(0, Math.min(root.folderRows.length - 1, root.folderIndex + step))
+              event.accepted = true
+              return
+            }
+            if (root.folderPath && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                || (event.key === Qt.Key_C && event.modifiers === Qt.ControlModifier
+                    && input.selectedText.length === 0))) {
+              var entry = root.folderRows[root.folderIndex]
+              if (entry && entry.kind === "file") {
+                if (event.key === Qt.Key_C) Util.execArgv(["wl-copy", "--", entry.payload.path])
+                else root.openPath(event.modifiers & Qt.ShiftModifier ? entry.payload.dir : entry.payload.path)
+              }
+              event.accepted = true
+              return
+            }
+            // The arrows are claimed only when they browse; anywhere else they
+            // stay caret keys for the query.
+            if ((event.key === Qt.Key_Right || event.key === Qt.Key_Left)
+                && event.modifiers === Qt.NoModifier && root.navigatingResults) {
+              var browsed = event.key === Qt.Key_Right
+                ? root.enterFolder() || root.folderPath !== ""
+                : root.leaveFolder()
+              if (browsed) {
+                event.accepted = true
+                return
+              }
+              if (event.key === Qt.Key_Left) root.navigatingResults = false
+            }
             if (event.key === Qt.Key_Escape) {
-              if (input.text.length > 0) input.text = ""
+              if (root.folderPath) { root.resetFolders(); root.rebuild() }
+              else if (input.text.length > 0) input.text = ""
               else root.dismiss()
               event.accepted = true
-            } else if (event.key === Qt.Key_Down
-                || (event.key === Qt.Key_N && event.modifiers === Qt.ControlModifier)) {
+            } else if (down) {
               root.select(1)
+              root.navigatingResults = true
               event.accepted = true
-            } else if (event.key === Qt.Key_Up
-                || (event.key === Qt.Key_P && event.modifiers === Qt.ControlModifier)) {
+            } else if (up) {
               root.select(-1)
+              root.navigatingResults = true
               event.accepted = true
             } else if (event.key === Qt.Key_PageDown) {
+              root.navigatingResults = true
               root.selectPage(1)
               event.accepted = true
             } else if (event.key === Qt.Key_PageUp) {
+              root.navigatingResults = true
               root.selectPage(-1)
               event.accepted = true
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               var secondary = (event.modifiers & Qt.ShiftModifier) || (event.modifiers & Qt.ControlModifier)
               root.activateSelection(secondary ? true : false)
               event.accepted = true
+            } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier)
+                && input.selectedText.length === 0 && root.copyPathTarget() !== "") {
+              // Ctrl+C on a file result copies its path, the way Cmd+C does in
+              // Spotlight. Only when nothing is selected in the query: with a
+              // selection this is an ordinary copy and has to stay one.
+              root.copySelectedPath()
+              event.accepted = true
             } else if (event.key === Qt.Key_Tab) {
-              // Tab completes the query with the selected row's title, the way
-              // a shell completes a path — handy for narrowing an app search.
-              var sel = root.selectedRow()
-              if (sel && sel.kind === "app") input.text = sel.title
+              // Tab completes the row Enter would act on.
+              var completion = Query.completionText(root.folderPath
+                ? root.folderRows[root.folderIndex] : root.rows[root.targetIndex()])
+              if (completion) {
+                input.text = completion
+                input.cursorPosition = input.text.length
+              }
               event.accepted = true
             }
           }
         }
       }
 
+      // Both dividers stop where a row's highlight stops, so the list reads as
+      // one column with two rules across it rather than as three stacked bands.
       Rectangle {
         id: searchDivider
         anchors { top: searchRow.bottom; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.cardBorderWidth
-        anchors.rightMargin: root.cardBorderWidth
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
-        visible: card.hasResults
       }
 
       // ------------------------------------------------------- results
       Item {
+        id: resultsArea
         anchors {
           top: searchDivider.bottom
           left: parent.left
-          right: parent.right
         }
         anchors.topMargin: root.listPadding
         anchors.bottomMargin: root.listPadding
-        height: card.listHeight
-        visible: card.hasResults
+        width: root.previewShown ? Math.round(card.width * 0.58) : card.width
+        height: card.bodyHeight
+        visible: !root.aiActive
 
         ListView {
           id: resultList
@@ -1724,28 +3327,27 @@ Item {
           boundsBehavior: Flickable.StopAtBounds
           currentIndex: root.selectedIndex
           highlightMoveDuration: 0
-
-          section.property: "section"
-          section.criteria: ViewSection.FullString
+          section.property: "rowSection"
           section.delegate: Item {
             required property string section
-            width: ListView.view.width
-            height: root.sectionHeight
 
-            // Sentence case, not caps: it is what Raycast does, and a
-            // tracked-out all-caps label is the tell of a templated UI.
+            width: resultList.width
+            height: section.length > 0 ? root.sectionHeight : 0
+
             Text {
               text: parent.section
               textFormat: Text.PlainText
+              elide: Text.ElideRight
               color: root.foreground
-              opacity: 0.45
+              opacity: 0.5
               font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.weight: Font.Medium
+              font.pixelSize: Style.font.caption
               anchors.left: parent.left
-              anchors.leftMargin: root.rowInset + root.listPadding
+              anchors.leftMargin: root.gutter
+              anchors.right: parent.right
+              anchors.rightMargin: root.gutter
               anchors.bottom: parent.bottom
-              anchors.bottomMargin: Style.space(7)
+              anchors.bottomMargin: Style.space(3)
             }
           }
 
@@ -1763,9 +3365,12 @@ Item {
             required property string rowIcon
             required property string rowImage
             required property bool rowMono
+            required property string rowState
             required property bool selectable
 
             readonly property bool hasCursor: root.cursorActive && resultRow.index === root.selectedIndex
+            readonly property bool showSwitch: resultRow.rowState.length > 0
+              && root.toggleStates[resultRow.rowState] !== undefined
             readonly property bool armed: root.armedKey.length > 0
               && root.rows[resultRow.rowIndex]
               && root.rows[resultRow.rowIndex].key === root.armedKey
@@ -1780,11 +3385,9 @@ Item {
               anchors.rightMargin: root.listPadding
               radius: root.rowRadius
               color: resultRow.armed
-                ? Util.alpha(Color.urgent, 0.22)
+                ? Util.alpha(Commons.Color.urgent, 0.22)
                 : (resultRow.hasCursor ? root.selectedBackground : "transparent")
             }
-
-            readonly property bool hasIcon: (resultRow.rowImage.length > 0) || (resultRow.rowIcon.length > 0)
 
             Image {
               id: rowImageItem
@@ -1803,13 +3406,13 @@ Item {
 
             Text {
               id: rowGlyph
-              visible: resultRow.rowImage.length === 0 && resultRow.rowIcon.length > 0
+              visible: resultRow.rowImage.length === 0
               text: resultRow.rowIcon
               textFormat: Text.PlainText
               color: resultRow.hasCursor ? root.selectedText : root.foreground
               opacity: resultRow.hasCursor ? 1 : 0.75
               font.family: root.fontFamily
-              font.pixelSize: Style.font.icon
+              font.pixelSize: Style.font.iconLarge
               width: Style.space(20)
               horizontalAlignment: Text.AlignHCenter
               anchors.left: rowSurface.left
@@ -1817,11 +3420,24 @@ Item {
               anchors.verticalCenter: rowSurface.verticalCenter
             }
 
+            PillSwitch {
+              id: rowSwitch
+              visible: resultRow.showSwitch && !resultRow.armed
+              checked: root.toggleStates[resultRow.rowState] === true
+              accent: root.accent
+              foreground: root.foreground
+              anchors.right: rowSurface.right
+              anchors.rightMargin: root.rowInset
+              anchors.verticalCenter: rowSurface.verticalCenter
+            }
+
             Text {
               id: accessoryText
+              // The switch replaces the "Action" label rather than crowding it.
+              visible: !rowSwitch.visible
               text: resultRow.armed ? "Press ↵ again to confirm" : resultRow.rowAccessory
               textFormat: Text.PlainText
-              color: resultRow.armed ? Color.urgent : root.foreground
+              color: resultRow.armed ? Commons.Color.urgent : root.foreground
               opacity: resultRow.armed ? 1 : 0.38
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -1831,9 +3447,9 @@ Item {
             }
 
             Row {
-              anchors.left: resultRow.hasIcon ? (rowImageItem.visible ? rowImageItem.right : rowGlyph.right) : rowSurface.left
-              anchors.leftMargin: resultRow.hasIcon ? Style.space(10) : root.rowInset
-              anchors.right: accessoryText.left
+              anchors.left: rowGlyph.right
+              anchors.leftMargin: Style.space(10)
+              anchors.right: rowSwitch.visible ? rowSwitch.left : accessoryText.left
               anchors.rightMargin: Style.space(14)
               anchors.verticalCenter: rowSurface.verticalCenter
               spacing: Style.space(8)
@@ -1891,11 +3507,66 @@ Item {
         }
       }
 
+      Rectangle {
+        id: previewDivider
+        visible: root.previewShown
+        anchors { top: searchDivider.bottom; bottom: footerDivider.top; left: resultsArea.right }
+        width: root.hairline
+        color: root.dividerColor
+      }
+
+      PreviewPane {
+        id: previewPane
+        visible: previewDivider.visible
+        anchors {
+          top: searchDivider.bottom
+          bottom: footerDivider.top
+          left: previewDivider.right
+          right: parent.right
+        }
+        folderPath: root.folderPath
+        folderRows: root.folderRows
+        folderIndex: root.folderIndex
+        preview: root.preview
+        live: root.opened && visible
+        foreground: root.foreground
+        accent: root.accent
+        fontFamily: root.fontFamily
+        gutter: root.gutter - root.listPadding
+      }
+
+      AiPanel {
+        id: aiPanel
+        visible: panel.visible && root.aiActive
+        anchors {
+          top: searchDivider.bottom
+          left: parent.left
+          right: parent.right
+        }
+        height: card.bodyHeight + root.listPadding * 2
+        foreground: root.foreground
+        accent: root.accent
+        fontFamily: root.fontFamily
+        busy: root.aiBusy
+        error: root.aiError
+        progress: root.aiProgress
+        result: root.aiResult
+        helperCommand: root.helperArgv([])
+        onCopyRequested: function(value) { Util.execArgv(["wl-copy", "--", value]) }
+        onOpenRequested: function(url) { root.openUrl(url) }
+        onBackRequested: { root.aiActive = false; root.rebuild(); input.forceActiveFocus() }
+        onDismissRequested: root.dismiss()
+        onCancelRequested: { root.stopAi(); root.rebuild(); input.forceActiveFocus() }
+        onScrollYChanged: if (root.opened && root.aiActive && (root.aiResult || root.aiBusy) && !aiPanel.restoringScroll)
+          root.aiReadPosition = scrollY
+      }
+
       // ------------------------------------------------------- footer
       Rectangle {
+        id: footerDivider
         anchors { bottom: footer.top; left: parent.left; right: parent.right }
-        anchors.leftMargin: root.cardBorderWidth
-        anchors.rightMargin: root.cardBorderWidth
+        anchors.leftMargin: root.listPadding
+        anchors.rightMargin: root.listPadding
         height: root.hairline
         color: root.dividerColor
       }
@@ -1907,14 +3578,16 @@ Item {
         height: root.footerHeight
 
         Text {
-          text: "󰣇  Omarchy // Lunardi0x01"
+          text: root.settingsSaveFailed ? "Settings not saved" : "󰣇  Omarchy // Lunardi0x01"
           textFormat: Text.PlainText
-          color: root.foreground
-          opacity: 0.35
+          color: root.settingsSaveFailed ? Commons.Color.urgent : root.foreground
+          opacity: root.settingsSaveFailed ? 1 : 0.35
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           anchors.left: parent.left
-          anchors.leftMargin: root.gutter
+          // The mark sits inside the rail the rows use, so it reads as a corner
+          // signature, but not so far out that it crowds the rounded corner.
+          anchors.leftMargin: Style.space(15)
           anchors.verticalCenter: parent.verticalCenter
         }
 
@@ -1925,9 +3598,10 @@ Item {
           spacing: Style.space(14)
 
           Text {
-            readonly property var sel: root.selectedRow()
-            text: sel && sel.primaryLabel ? "↵  " + sel.primaryLabel : ""
-            visible: text.length > 0
+            readonly property var sel: root.folderPath ? root.folderRows[root.folderIndex] : root.selectedRow()
+            text: "→  Browse folder"
+            visible: !root.aiActive && root.previewShown && sel !== null && sel !== undefined
+              && sel.kind === "file" && sel.accessory === "Folder"
             textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.55
@@ -1936,9 +3610,30 @@ Item {
           }
 
           Text {
-            readonly property var sel: root.selectedRow()
+            readonly property var sel: root.folderPath ? root.folderRows[root.folderIndex] : root.selectedRow()
+            text: sel && sel.primaryLabel ? "↵  " + root.primaryLabelFor(sel) : ""
+            visible: !root.aiActive && text.length > 0
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: 0.55
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            readonly property var sel: root.folderPath ? root.folderRows[root.folderIndex] : root.selectedRow()
             text: sel && sel.secondaryLabel ? "⇧↵  " + sel.secondaryLabel : ""
-            visible: text.length > 0
+            visible: !root.aiActive && text.length > 0
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: 0.4
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            text: root.copyPathTarget() !== "" ? "⌃C  Copy path" : ""
+            visible: !root.aiActive && text.length > 0
             textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.4
@@ -1948,21 +3643,88 @@ Item {
         }
       }
     }
+
+    SetupTour {
+      id: tour
+      opacity: root.presentationProgress
+      scale: 0.98 + 0.02 * root.presentationProgress
+      visible: root.tourActive
+      anchors.centerIn: parent
+      foreground: root.foreground
+      accent: root.accent
+      fontFamily: root.fontFamily
+      surface: root.glassBackground
+      surfaceBorder: root.glassBorder
+      sheen: root.glassSheen
+      hairline: root.hairline
+      surfaceRadius: root.cardRadius
+      rowRadius: root.rowRadius
+      currentBinding: root.tourBinding.current
+      previousBinding: root.tourBinding.previous
+      bindingManaged: root.tourBinding.managed
+      boundChords: root.tourBinding.bound
+      bindingState: root.bindingState
+      aiModels: root.aiModels
+      onBindingRequested: function(chord) { root.writeBinding(chord) }
+      onRevertRequested: root.revertBinding()
+      onFinished: function(patch) { root.finishTour(patch) }
+    }
+
+    SettingsPanel {
+      id: settingsPanel
+      opacity: root.presentationProgress
+      scale: 0.98 + 0.02 * root.presentationProgress
+      visible: root.settingsActive
+      anchors.centerIn: parent
+      foreground: root.foreground
+      accent: root.accent
+      fontFamily: root.fontFamily
+      surface: root.glassBackground
+      surfaceBorder: root.glassBorder
+      sheen: root.glassSheen
+      hairline: root.hairline
+      surfaceRadius: root.cardRadius
+      rowRadius: root.rowRadius
+      settings: root.settings
+      aiModels: root.aiModels
+      pendingSettings: Object.assign({}, root.settingsWrites.active, root.settingsWrites.pending)
+      saveFailed: root.settingsSaveFailed
+      saveError: root.settingsSaveError
+      currentBinding: root.tourBinding.current
+      // Cap the panel height; the remaining rows scroll.
+      availableHeight: Math.min(panel.height - Style.space(96),
+                                Math.max(Style.space(420), panel.height * 0.5))
+      onChanged: function(patch) { root.queueSettings(patch) }
+      onClosed: root.closeSettingsPanel()
+      onAction: function(name) {
+        switch (name) {
+        case "edit":
+          root.editSettingsFile()
+          break
+        case "shortcut":
+          root.leaveSettingsPanel()
+          root.tourFromSettings = true
+          root.showTour(1, true)
+          break
+        case "tour":
+          root.leaveSettingsPanel()
+          root.tourFromSettings = true
+          root.showTour(0, false)
+          break
+        case "data":
+          root.dismiss()
+          root.openDataFolder()
+          break
+        case "reset":
+          root.resetLearning()
+          break
+        case "retry":
+          root.settingsWrites = SettingsQueue.retry(root.settingsWrites)
+          root.flushSettings()
+          break
+        }
+      }
+    }
   }
 
-  // Total height the result list wants, headers included. Driving the card
-  // height off this is what gives the panel the Raycast grow/shrink feel.
-  readonly property int contentHeight: {
-    if (displayModel.count === 0) return 0
-    var total = 0
-    var lastSection = ""
-    for (var i = 0; i < root.rows.length; i++) {
-      if (root.rows[i].section !== lastSection) {
-        total += root.sectionHeight
-        lastSection = root.rows[i].section
-      }
-      total += root.rowHeight
-    }
-    return total
-  }
 }
