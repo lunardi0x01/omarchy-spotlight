@@ -1,4 +1,14 @@
-# Spotlight
+# My Spotlight
+
+> **This is lunardi0x01's fork of [maajix/omarchy-spotlight](https://github.com/maajix/omarchy-spotlight).**
+> It tracks upstream and adds a few visual changes:
+>
+> - Square corners and a 2px border on the launcher and its rows.
+> - Icon glyphs instead of app icons. Set `"showAppIcons": true` in `spotlight.json` to get the app icons back.
+> - Omarchy web apps are labelled "Web App"; commands and menu items get a terminal glyph.
+> - The footer reads "Omarchy // Lunardi0x01".
+>
+> Its plugin id is `lunardi0x01.spotlight`, so it can sit beside the original. The rest of this README is upstream's.
 
 **A fast, local-first command palette for Omarchy.**
 
@@ -13,7 +23,7 @@ Launch apps, switch windows, find files, search your clipboard and control your 
 Requires **Omarchy 4 (Quattro)**. Core features use tools already included with Omarchy.
 
 ```bash
-omarchy plugin add https://github.com/maajix/omarchy-spotlight.git --enable
+omarchy plugin add https://github.com/lunardi0x01/omarchy-spotlight.git --enable
 ```
 
 Press **Alt+Space** to open Spotlight. The first-run tour sets up the shortcut; if it is already taken, choose another. Search for `spotlight settings` to change sources, behavior or the shortcut later.
@@ -25,7 +35,7 @@ Under **Appearance**, **Vertical position** moves the launcher from 0% (top) to 
 If the shortcut does not open Spotlight:
 
 ```bash
-omarchy-shell shell toggle io.github.maajix.spotlight '{}'
+omarchy-shell shell toggle lunardi0x01.spotlight '{}'
 ```
 
 ## Try it
