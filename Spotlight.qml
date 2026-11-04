@@ -385,7 +385,8 @@ Item {
   // Frosted glass needs something left to frost: at 0.86 the card is opaque
   // and Hyprland's blur has no visible effect. 0.62 keeps text contrast while
   // letting the blurred wallpaper through as colour and shape.
-  readonly property color glassBackground: Util.alpha(Commons.Color.menu.background, 0.62)
+  // Nearly opaque (upstream uses 0.62), so the page behind does not show through (lunardi0x01).
+  readonly property color glassBackground: Util.alpha(Commons.Color.menu.background, 0.96)
   readonly property color glassBorder: Util.alpha(Commons.Color.foreground, 0.09)
   readonly property color glassSheen: Util.alpha("#ffffff", 0.07)
   readonly property color scrim: Util.alpha(Commons.Color.menu.scrim, 0.25)
